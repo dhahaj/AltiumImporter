@@ -26,6 +26,41 @@ SILK_RGB = (245, 245, 240)
 COPPER_RGB = (200, 140, 60)
 PLACEHOLDER_RGB = (60, 60, 60)
 
+WHITE_SILK = (245, 245, 240)
+BLACK_SILK = (28, 28, 28)
+# (dialog name, mask RGB, silkscreen RGB, mask opacity). Lighter and darker
+# masks are made more opaque, as real ones hide the copper more.
+COLOR_PRESETS = [
+    ("Green / white", (20, 100, 45), WHITE_SILK, 0.92),
+    ("Black / white", (22, 22, 24), WHITE_SILK, 0.97),
+    ("White / black", (236, 236, 230), BLACK_SILK, 0.96),
+    ("Red / white", (165, 22, 28), WHITE_SILK, 0.93),
+    ("Purple / white", (72, 32, 112), WHITE_SILK, 0.93),
+    ("Blue / white", (18, 58, 145), WHITE_SILK, 0.93),
+    ("Yellow / black", (222, 188, 28), BLACK_SILK, 0.94),
+    ("Matte green / white", (38, 82, 50), WHITE_SILK, 0.96),
+]
+
+
+def parse_color(text):
+    """'#1a6b2d', '1a6b2d', '26,107,45' or '26 107 45' -> (r, g, b), else None."""
+    t = (text or "").strip().lstrip("#")
+    try:
+        if len(t) == 6 and all(c in "0123456789abcdefABCDEF" for c in t):
+            return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+        parts = [p for p in t.replace(",", " ").split() if p]
+        if len(parts) == 3:
+            rgb = tuple(int(float(p)) for p in parts)
+            if all(0 <= v <= 255 for v in rgb):
+                return rgb
+    except ValueError:
+        pass
+    return None
+
+
+def color_hex(rgb):
+    return "#%02X%02X%02X" % tuple(rgb)
+
 
 class Options:
     def __init__(self):
@@ -46,8 +81,9 @@ class Options:
         self.silk_text = True
         self.mask_thickness_mm = 0.02
         self.silk_thickness_mm = 0.015
-        self.mask_rgb = (20, 100, 45)
-        self.mask_opacity = 0.92
+        self.mask_rgb = COLOR_PRESETS[0][1]
+        self.silk_rgb = COLOR_PRESETS[0][2]
+        self.mask_opacity = COLOR_PRESETS[0][3]
         self.debug_log = None           # path: append timestamped progress lines
 
     @property
@@ -78,19 +114,27 @@ def matmul(a, b):
     return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
 
 
-def body_rotation(body):
+def body_rotation(body, comp_bottom=None):
     """Rotation matrix placing an Altium STEP model in board space.
 
-    Altium stores MODEL.3D.ROTZ as an absolute angle (it already includes the
-    component rotation), and ROTX/ROTY as the model's own base orientation.
-    Bottom-side bodies are flipped about the board's Y axis (Altium mirrors
-    left/right when a part is sent to the bottom side).
+    Follows KiCad's Altium importer, whose 3D view matches Altium:
+    * MODEL.3D.ROTZ is absolute (it already includes the component
+      rotation); MODEL.2D.ROTATION is subtracted from it.
+    * ROTX/ROTY are the model's own base orientation, applied first.
+    * A component on the bottom side is flipped about the board's X axis
+      (y -> -y, z -> -z), after its rotations.
+    * A body projected to the other side than its component gets an extra
+      180 deg about X and a mirrored Z angle.
     """
     rx, ry, rz = body.rot3d
-    r = matmul(rot_y(ry), rot_x(rx))
-    if body.bottom:
-        r = matmul(rot_y(180.0), r)
-    return matmul(rot_z(rz + body.rotation), r)
+    flipped = body.bottom if comp_bottom is None else comp_bottom
+    if body.bottom != flipped:
+        rx += 180.0
+        rz = -rz
+    r = matmul(rot_z(rz - body.rotation), matmul(rot_y(ry), rot_x(rx)))
+    if flipped:
+        r = matmul(rot_x(180.0), r)
+    return r
 
 
 def arc_sweep(seg):
@@ -441,7 +485,10 @@ class Builder:
                         part = lb.subtract(part, openings)     # fabs clip silk off pads
                         part = lb.subtract(part, drills)
                         self.add_temp_body(comp, part, "%s silkscreen" % label if j == 0
-                                           else "%s silkscreen %d" % (label, j + 1), SILK_RGB)
+                                           else "%s silkscreen %d" % (label, j + 1), opt.silk_rgb)
+            if lb.fallback_fonts:
+                self.log.append("Silkscreen: font(s) not installed on this PC, stand-ins used: %s"
+                                % "; ".join("%s -> %s" % kv for kv in sorted(lb.fallback_fonts.items())))
             if lb.failed:
                 self.log.append("Layers: %d shapes could not be built: %s" % (lb.failed, lb.fail_summary()))
         finally:
@@ -478,7 +525,7 @@ class Builder:
         board = ext.bodies.item(0)
         board.name = "PCB core" if self.opt.copper else "PCB"
         self.board_comp = comp
-        ap = self.appearance(CORE_RGB if self.opt.mask else BOARD_RGB)
+        ap = self.appearance(CORE_RGB if self.opt.mask else self.opt.mask_rgb)
         if ap:
             board.appearance = ap
 
@@ -543,7 +590,7 @@ class Builder:
                 try:
                     if b.embedded and b.model_id in doc.models:
                         if self.opt.step_models:
-                            self.place_step(cc, b)
+                            self.place_step(cc, b, c.bottom)
                             stats["step"] += 1
                             made = True
                     elif self.opt.extruded_bodies and b.outline and b.overall > b.standoff:
@@ -623,8 +670,8 @@ class Builder:
                 ext.bodies.item(i).appearance = ap
         return ext
 
-    def body_matrix(self, b):
-        r = body_rotation(b)
+    def body_matrix(self, b, comp_bottom=None):
+        r = body_rotation(b, comp_bottom)
         z = -b.dz if b.bottom else self.t + b.dz
         tx, ty, tz = (b.x - self.ox) * CM, (b.y - self.oy) * CM, z * CM
         m = adsk.core.Matrix3D.create()
@@ -634,8 +681,8 @@ class Builder:
                         0, 0, 0, 1])
         return m
 
-    def place_step(self, comp, b):
-        mat = self.body_matrix(b)
+    def place_step(self, comp, b, comp_bottom=None):
+        mat = self.body_matrix(b, comp_bottom)
         existing = self._model_components.get(b.model_id)
         if existing:
             self.add_instance(comp, existing, mat)

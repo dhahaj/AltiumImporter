@@ -15,6 +15,7 @@ import adsk.core
 import adsk.fusion
 
 import layer_geometry as lg
+import font_metrics
 
 CM = 0.1
 P3 = adsk.core.Point3D.create
@@ -55,6 +56,8 @@ class LayerBuilder:
         self._scratch_doc = None
         self._scratch = None
         self._text_cache = {}
+        self._bad_fonts = set()
+        self.fallback_fonts = {}        # font Fusion could not use -> substitute used
         self.failed = 0
         self.fail_info = {}     # kind -> [count, first error]
 
@@ -259,23 +262,84 @@ class LayerBuilder:
         return solid
 
     # -- text ----------------------------------------------------------------
+    def _text_metrics(self, t):
+        """(cap height, baseline offset) in mm for Altium text height t.height.
+
+        Stroke fonts: Altium's height is (nearly) the cap height and the
+        position is on the baseline. TrueType: Altium's height is the whole
+        font cell (winAscent + winDescent) and the position is the bottom of
+        that cell, so the baseline sits one descent above it. Metrics come from
+        the font Altium asked for, even when Fusion falls back to Arial, so the
+        text keeps the size it has in Altium.
+        """
+        h = t.height
+        if t.font_type == 1:
+            cap, desc = font_metrics.metrics(t.font_name or "Arial", t.bold, t.italic)
+            return h * cap, h * desc
+        return h * 0.98, 0.0
+
+    @staticmethod
+    def _substitute(font):
+        """(Windows font, horizontal scale) standing in for a font that isn't
+        installed, chosen to keep roughly the same width so labels don't run
+        into each other: condensed faces become narrowed Arial, monospaced
+        ones Consolas, black/heavy weights Arial Black."""
+        f = font.lower()
+        if "mono" in f or "code" in f or "console" in f or "courier" in f:
+            return "Consolas", 1.0
+        if "black" in f or "heavy" in f:
+            return "Arial Black", 1.0
+        if "compressed" in f or "extra cond" in f or "extracond" in f:
+            return "Arial", 0.70
+        if "cond" in f or "narrow" in f:
+            return "Arial", 0.82
+        return "Arial", 1.0
+
+    def _font_for(self, t):
+        """(font Fusion should use, horizontal scale) for text t."""
+        if t.font_type != 1 or not t.font_name:
+            return "Arial", 1.0
+        font = t.font_name
+        if font not in self._bad_fonts:
+            return font, 1.0
+        sub, sx = self._substitute(font)
+        if sub in self._bad_fonts:
+            sub = "Arial"
+        return sub, sx
+
+    def _mark_bad(self, t, font):
+        self._bad_fonts.add(font)
+        if t.font_name and t.font_name in self._bad_fonts:
+            sub, sx = self._substitute(t.font_name)
+            if sub in self._bad_fonts:
+                sub = "Arial"
+            self.fallback_fonts[t.font_name] = sub + (" (narrowed)" if sx < 1 else "")
+
     def text_solid(self, t, z0, z1):
         """Extruded text at its Altium position. Returns a temporary solid."""
-        font = t.font_name if (t.font_type == 1 and t.font_name) else "Arial"
-        key = (t.text, round(t.height, 4), font, t.bold, t.italic, t.mirrored,
+        font, sx = self._font_for(t)
+        cap, base_off = self._text_metrics(t)
+        key = (t.text, round(cap, 4), font, sx, t.bold, t.italic, t.mirrored,
                round(z1 - z0, 5))
-        base = self._text_cache.get(key)
-        if base is None:
+        hit = self._text_cache.get(key)
+        if hit is None:
             comp = self.scratch()
             sk = comp.sketches.add(comp.xYConstructionPlane)
-            h = t.height * CM
+            hc = cap * CM
             lines = t.text.split("\n")
-            width = max(len(s) for s in lines) * h * 1.2 + h
-            ti = sk.sketchTexts.createInput2(t.text, h * 0.98)
-            ti.setAsMultiLine(P3(0, 0, 0), P3(width, h * 1.4 * len(lines), 0),
+            width = max(len(s) for s in lines) * hc * 2.0 + hc
+            ti = sk.sketchTexts.createInput2(t.text, hc)
+            ti.setAsMultiLine(P3(0, 0, 0), P3(width, hc * 2.4 * len(lines), 0),
                               adsk.core.HorizontalAlignments.LeftHorizontalAlignment,
                               adsk.core.VerticalAlignments.BottomVerticalAlignment, 0)
-            ti.fontName = font
+            try:
+                ti.fontName = font
+            except Exception:
+                if font == "Arial":
+                    raise
+                sk.deleteMe()
+                self._mark_bad(t, font)
+                return self.text_solid(t, z0, z1)
             style = 0
             if t.bold:
                 style |= adsk.fusion.TextStyles.TextStyleBold
@@ -285,7 +349,15 @@ class LayerBuilder:
                 ti.textStyle = style
             if t.mirrored:
                 ti.isHorizontalFlip = True
-            st = sk.sketchTexts.add(ti)
+            try:
+                st = sk.sketchTexts.add(ti)
+            except Exception:
+                if font == "Arial":
+                    raise
+                # font not installed for Fusion: use a stand-in
+                sk.deleteMe()
+                self._mark_bad(t, font)
+                return self.text_solid(t, z0, z1)
             ext = comp.features.extrudeFeatures.addSimple(
                 st, adsk.core.ValueInput.createByReal((z1 - z0) * CM),
                 adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
@@ -301,26 +373,63 @@ class LayerBuilder:
             sk.deleteMe()
             if base is None:
                 return None
-            # anchor: Altium puts the bottom-left of the text at the position
-            # (bottom-right when mirrored)
+            if abs(sx - 1.0) > 1e-6:
+                # narrowed stand-in for a condensed font (scale about x=0)
+                m = adsk.core.Matrix3D.create()
+                m.setWithArray([sx, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+                self.tb.transform(base, m)
+            # normalise: left ink edge at x=0 (right edge when mirrored),
+            # last line's baseline stays at y=0 (Fusion's bottom alignment)
             bb = base.boundingBox
+            ink_w = (bb.maxPoint.x - bb.minPoint.x) / CM
             dx = -bb.maxPoint.x if t.mirrored else -bb.minPoint.x
-            dy = -bb.minPoint.y
             m = adsk.core.Matrix3D.create()
-            m.translation = V3(dx, dy, 0)
+            m.translation = V3(dx, 0, 0)
             self.tb.transform(base, m)
-            self._text_cache[key] = base
+            hit = (base, ink_w)
+            self._text_cache[key] = hit
+        base, ink_w = hit
+        lx, ly = self._text_offset(t, ink_w, base_off)
+        if t.mirrored:
+            lx = -lx
         body = self.tb.copy(base)
         m = adsk.core.Matrix3D.create()
         a = math.radians(t.rotation)
+        ca, sa = math.cos(a), math.sin(a)
         x, y = self.xy(t.x, t.y)
-        m.setWithArray([math.cos(a), -math.sin(a), 0, x,
-                        math.sin(a), math.cos(a), 0, y,
+        x += (ca * lx - sa * ly) * CM
+        y += (sa * lx + ca * ly) * CM
+        m.setWithArray([ca, -sa, 0, x,
+                        sa, ca, 0, y,
                         0, 0, 1, z0 * CM,
                         0, 0, 0, 1])
         if not self.tb.transform(body, m):
             return None
         return body
+
+    @staticmethod
+    def _text_offset(t, ink_w, base_off):
+        """Where the text block's left edge / last baseline goes, in mm, in
+        the text's own (unrotated, unmirrored) frame relative to its position."""
+        if not getattr(t, "frame", False) or t.box_w <= 0 or t.box_h <= 0:
+            return 0.0, base_off
+        n = t.text.count("\n") + 1
+        block_h = n * t.height
+        mg = min(t.margin, t.box_w / 2, t.box_h / 2)
+        col, row = divmod((t.justify or 3) - 1, 3)   # col 0 L/1 C/2 R, row 0 T/1 C/2 B
+        if col == 0:
+            lx = mg
+        elif col == 1:
+            lx = (t.box_w - ink_w) / 2
+        else:
+            lx = t.box_w - mg - ink_w
+        if row == 0:
+            bottom = t.box_h - mg - block_h
+        elif row == 1:
+            bottom = (t.box_h - block_h) / 2
+        else:
+            bottom = mg
+        return lx, bottom + base_off
 
     # -- assembly of a layer ---------------------------------------------------
     def union_all(self, prims, z0, z1, progress=None, extra=None):
