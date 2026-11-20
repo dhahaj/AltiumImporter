@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion",
+  "type": "addin",
+  "id": "06da52eb-07bd-4b1e-9bc8-e460c03ac6c8",
+  "author": "Daniel",
+  "description": {
+    "": "Import Altium Designer .PcbDoc files as 3D board + component models"
+  },
+  "version": "0.1.0",
+  "runOnStartup": true,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
