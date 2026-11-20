@@ -1,2 +1,4 @@
-lib/__pycache__/
 __pycache__/
+lib/__pycache__/
+# per-user dialog choices written by the add-in
+settings.json

@@ -220,7 +220,9 @@ class Via:
 class Text:
     __slots__ = ("layer", "component", "x", "y", "height", "rotation", "mirrored",
                  "stroke_width", "font_type", "font_name", "bold", "italic",
-                 "is_designator", "is_comment", "text", "inverted")
+                 "is_designator", "is_comment", "text", "inverted",
+                 # text frame ("text box") support
+                 "frame", "box_w", "box_h", "margin", "justify")
 
 
 class Body:
@@ -436,7 +438,9 @@ class PcbDocReader:
                 if t.is_designator:
                     t.text = c.designator if c.name_on else ""
                 elif t.is_comment:
-                    t.text = (c.comment or t.text) if c.comment_on else ""
+                    # the text record already holds the resolved Comment string;
+                    # Components6 has no COMMENT field in current Altium files
+                    t.text = (t.text or c.comment) if c.comment_on else ""
         for p in doc.pads:
             if 0 <= p.component < len(doc.components):
                 doc.components[p.component].pads.append(p)
@@ -755,6 +759,7 @@ class PcbDocReader:
             t.stroke_width = r.mm()
             t.is_comment = t.is_designator = t.bold = t.italic = t.inverted = False
             t.font_type, t.font_name = 0, ""
+            t.frame, t.box_w, t.box_h, t.margin, t.justify = False, 0.0, 0.0, 0.0, 3
             widx = None
             if n >= 123:
                 t.is_comment = r.u8() != 0
@@ -766,8 +771,32 @@ class PcbDocReader:
                 t.font_name = r.d[r.p:r.p + 64].decode("utf-16-le", "replace").split("\0")[0]
                 r.skip(64)
                 t.inverted = r.u8() != 0
-                r.mm()
+                margin = r.mm()
                 widx = r.u32()
+                # layout fields as decoded by KiCad's Altium importer (ATEXT6)
+                try:
+                    r.skip(4)
+                    r.u8()                              # inverted rect
+                    t.box_w, t.box_h = r.mm(), r.mm()
+                    just = r.u8()
+                    offset = r.mm()
+                    rem = r.sub_remaining()
+                    if rem >= 93:
+                        r.skip(8 + 8 + 4 + 1 + 1 + 1)
+                        t.font_type = r.u8()             # 2 = barcode
+                        r.skip(64 + 1 + 4)
+                    offset_border = False
+                    if rem >= 103:
+                        t.frame = r.u8() != 0
+                        offset_border = r.u8() != 0
+                        r.skip(8)
+                    else:
+                        t.frame = t.box_w > 0 and t.box_h > 0
+                    valid = r.u8() != 0 if rem >= 115 else False
+                    t.justify = just if (valid and 1 <= just <= 9) else 3
+                    t.margin = offset if offset_border else margin
+                except (struct.error, IndexError):
+                    pass
             r.end_subrecord()
             r.subrecord()
             ln = r.u8() if r.sub_remaining() > 0 else 0
