@@ -7,6 +7,7 @@ plus components (embedded STEP models, Altium extruded 3D bodies, or
 placeholder boxes from the footprint pads).
 """
 
+import json
 import os
 import sys
 import traceback
@@ -21,11 +22,12 @@ if _LIB not in sys.path:
 
 import importlib  # noqa: E402
 import altium_pcbdoc  # noqa: E402
+import font_metrics  # noqa: E402
 import layer_geometry  # noqa: E402
 import fusion_layers  # noqa: E402
 import fusion_builder  # noqa: E402
 
-for _m in (altium_pcbdoc, layer_geometry, fusion_layers, fusion_builder):
+for _m in (altium_pcbdoc, font_metrics, layer_geometry, fusion_layers, fusion_builder):
     importlib.reload(_m)
 
 CMD_ID = "altiumImporter_importPcbDoc"
@@ -38,6 +40,39 @@ _app = None
 _ui = None
 _handlers = []
 _state = {"doc": None, "path": None}
+_SETTINGS = os.path.join(_HERE, "settings.json")
+
+
+def _load_settings():
+    try:
+        with open(_SETTINGS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_settings(**kw):
+    data = _load_settings()
+    data.update(kw)
+    try:
+        with open(_SETTINGS, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except Exception:
+        pass   # read-only install folder etc.: just don't remember
+
+
+CUSTOM_COLORS = "Custom..."
+
+
+def _custom_visible(inputs):
+    dd = inputs.itemById("colors")
+    custom = dd is not None and dd.selectedItem is not None and \
+        dd.selectedItem.name == CUSTOM_COLORS
+    for cid in ("mask_color", "silk_color"):
+        ci = inputs.itemById(cid)
+        if ci:
+            ci.isVisible = custom
 
 
 def _err(prefix=""):
@@ -62,6 +97,12 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             on_exec = ExecuteHandler()
             cmd.execute.add(on_exec)
             _handlers.append(on_exec)
+            on_changed = InputChangedHandler()
+            cmd.inputChanged.add(on_changed)
+            _handlers.append(on_changed)
+            on_validate = ValidateHandler()
+            cmd.validateInputs.add(on_validate)
+            _handlers.append(on_validate)
             _state["doc"] = None
 
             path = _pick_file()
@@ -99,9 +140,48 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             inputs.addBoolValueInput("mask", "Solder mask", True, "", True)
             inputs.addBoolValueInput("silk", "Silkscreen", True, "", True)
             inputs.addBoolValueInput("silk_text", "Silkscreen text", True, "", True)
+            prefs = _load_settings()
+            last = prefs.get("colors", fusion_builder.COLOR_PRESETS[0][0])
+            names = [p[0] for p in fusion_builder.COLOR_PRESETS] + [CUSTOM_COLORS]
+            if last not in names:
+                last = names[0]
+            colors = inputs.addDropDownCommandInput(
+                "colors", "Mask / silkscreen color", adsk.core.DropDownStyles.TextListDropDownStyle)
+            for n in names:
+                colors.listItems.add(n, n == last)
+            colors.tooltip = "Solder mask color / silkscreen color"
+            mc = inputs.addStringValueInput("mask_color", "Mask color",
+                                            prefs.get("mask_color", "#1A6B2D"))
+            mc.tooltip = "Hex (#1A6B2D) or R,G,B (26,107,45)"
+            sc = inputs.addStringValueInput("silk_color", "Silkscreen color",
+                                            prefs.get("silk_color", "#F5F5F0"))
+            sc.tooltip = "Hex (#F5F5F0) or R,G,B (245,245,240)"
+            _custom_visible(inputs)
             inputs.addBoolValueInput("new_doc", "Create in a new design", True, "", True)
         except Exception:
             _err("Failed to start import:\n")
+
+
+class InputChangedHandler(adsk.core.InputChangedEventHandler):
+    def notify(self, args):
+        try:
+            if args.input.id == "colors":
+                _custom_visible(args.inputs)
+        except Exception:
+            pass
+
+
+class ValidateHandler(adsk.core.ValidateInputsEventHandler):
+    def notify(self, args):
+        try:
+            inputs = args.inputs
+            dd = inputs.itemById("colors")
+            if dd and dd.selectedItem and dd.selectedItem.name == CUSTOM_COLORS:
+                ok = all(fusion_builder.parse_color(inputs.itemById(c).value)
+                         for c in ("mask_color", "silk_color"))
+                args.areInputsValid = ok
+        except Exception:
+            pass
 
 
 class ExecuteHandler(adsk.core.CommandEventHandler):
@@ -127,6 +207,19 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             opt.silk = inp.itemById("silk").value
             opt.silk_text = inp.itemById("silk_text").value
             opt.new_document = inp.itemById("new_doc").value
+            choice = inp.itemById("colors").selectedItem.name
+            if choice == CUSTOM_COLORS:
+                m_txt = inp.itemById("mask_color").value
+                s_txt = inp.itemById("silk_color").value
+                opt.mask_rgb = fusion_builder.parse_color(m_txt) or opt.mask_rgb
+                opt.silk_rgb = fusion_builder.parse_color(s_txt) or opt.silk_rgb
+                opt.mask_opacity = 0.94
+                _save_settings(colors=choice, mask_color=m_txt, silk_color=s_txt)
+            else:
+                for name, mask_rgb, silk_rgb, opacity in fusion_builder.COLOR_PRESETS:
+                    if name == choice:
+                        opt.mask_rgb, opt.silk_rgb, opt.mask_opacity = mask_rgb, silk_rgb, opacity
+                _save_settings(colors=choice)
 
             progress = _ui.createProgressDialog()
             progress.cancelButtonText = "Cancel"
