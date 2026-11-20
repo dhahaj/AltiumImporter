@@ -181,6 +181,8 @@ class Component:
         self.bottom = False
         self.height = 0.0
         self.comment = ""
+        self.name_on = True
+        self.comment_on = False
         self.pads = []
         self.bodies = []
 
@@ -204,11 +206,21 @@ class Component:
 
 class Pad:
     __slots__ = ("name", "component", "x", "y", "size", "rotation", "hole",
-                 "hole_shape", "slot_len", "slot_rotation", "plated", "layer")
+                 "hole_shape", "slot_len", "slot_rotation", "plated", "layer",
+                 "top_size", "bot_size", "top_shape", "bot_shape",
+                 "top_alt", "bot_alt", "top_corner", "bot_corner",
+                 "mask_mode", "mask_manual", "tent_top", "tent_bottom")
 
 
 class Via:
-    __slots__ = ("x", "y", "diameter", "hole")
+    __slots__ = ("x", "y", "diameter", "hole", "layer_start", "layer_end",
+                 "tent_top", "tent_bottom", "mask_manual", "mask_expansion")
+
+
+class Text:
+    __slots__ = ("layer", "component", "x", "y", "height", "rotation", "mirrored",
+                 "stroke_width", "font_type", "font_name", "bold", "italic",
+                 "is_designator", "is_comment", "text", "inverted")
 
 
 class Body:
@@ -251,7 +263,20 @@ class PcbDoc:
         self.vias = []
         self.bodies = []
         self.models = {}             # id -> Model
+        self.shapes = {}             # layer id -> [shape tuple], see add_shape()
+        self.texts = []
+        self.mask_expansion = 0.1016  # SolderMaskExpansion rule (default 4 mil)
+        self.copper_top = 0.035      # outer copper thickness (mm)
+        self.copper_bottom = 0.035
         self.warnings = []
+
+    def add_shape(self, layer, shape):
+        """shape is one of
+        ("track", x1, y1, x2, y2, width)
+        ("arc", cx, cy, radius, start_deg, end_deg, width)
+        ("poly", [Segment], [[Segment], ...])   outline + holes
+        """
+        self.shapes.setdefault(layer, []).append(shape)
 
     # convenience -----------------------------------------------------------
     def bounds(self):
@@ -272,7 +297,9 @@ class PcbDoc:
                 "%d vias, %d bodies (%d embedded STEP), %d models" % (
                     size, self.thickness, len(self.cutouts), len(self.components),
                     len(self.pads), len(self.vias), len(self.bodies), emb,
-                    len(self.models)))
+                    len(self.models))) + (
+            ", %d layer primitives, %d texts" % (sum(len(v) for v in self.shapes.values()),
+                                                 len(self.texts)))
 
 
 # ----------------------------------------------------------------------------
@@ -394,10 +421,22 @@ class PcbDocReader:
         self._components()
         self._pads()
         self._vias()
-        self._cutouts()
+        self._regions()
+        self._tracks()
+        self._arcs()
+        self._fills()
+        self._texts()
+        self._rules()
         self._bodies()
         if load_models:
             self._models()
+        for t in doc.texts:
+            if 0 <= t.component < len(doc.components):
+                c = doc.components[t.component]
+                if t.is_designator:
+                    t.text = c.designator if c.name_on else ""
+                elif t.is_comment:
+                    t.text = (c.comment or t.text) if c.comment_on else ""
         for p in doc.pads:
             if 0 <= p.component < len(doc.components):
                 doc.components[p.component].pads.append(p)
@@ -420,6 +459,8 @@ class PcbDocReader:
             t = sum(cu + d for _, cu, d in self.doc.stackup)
             if 0.05 < t < 20:
                 self.doc.thickness = t
+            self.doc.copper_top = self.doc.stackup[0][1] or 0.035
+            self.doc.copper_bottom = self.doc.stackup[-1][1] or 0.035
         if not self.doc.outline:
             self.doc.warnings.append("Board outline is empty")
 
@@ -437,7 +478,9 @@ class PcbDocReader:
             c.rotation = fnum(pr.get("ROTATION"))
             c.bottom = pr.get("LAYER", "TOP").upper() == "BOTTOM"
             c.height = unit_mm(pr.get("HEIGHT"))
-            c.comment = pr.get("SOURCELIBREFERENCE", "")
+            c.comment = pr.get("COMMENT", "") or pr.get("SOURCELIBREFERENCE", "")
+            c.name_on = fbool(pr.get("NAMEON"), True)
+            c.comment_on = fbool(pr.get("COMMENTON"), False)
             self.doc.components.append(c)
             idx += 1
 
@@ -463,9 +506,12 @@ class PcbDocReader:
         for _ in range(3):
             r.subrecord()
             r.end_subrecord()
-        n5 = r.subrecord()
+        r.subrecord()
         p.layer = r.u8()
-        r.skip(2)
+        flags1 = r.u8()
+        p.tent_top = (flags1 & 0x20) != 0
+        p.tent_bottom = (flags1 & 0x40) != 0
+        r.skip(1)
         r.u16()                      # net
         r.skip(2)
         p.component = r.u16()
@@ -473,24 +519,41 @@ class PcbDocReader:
             p.component = -1
         r.skip(4)
         p.x, p.y = r.mm(), r.mm()
-        top = (r.mm(), r.mm())
+        p.top_size = (r.mm(), r.mm())
         r.mm(); r.mm()               # mid size
-        bot = (r.mm(), r.mm())
-        p.size = top if top[0] > 0 else bot
+        p.bot_size = (r.mm(), r.mm())
+        p.size = p.top_size if p.top_size[0] > 0 else p.bot_size
         p.hole = r.mm()
-        r.skip(3)                    # shapes
+        p.top_shape = r.u8()
+        r.u8()
+        p.bot_shape = r.u8()
         p.rotation = r.f64()
         p.plated = r.u8() != 0
+        r.skip(1)
+        r.u8()                       # pad mode
+        r.skip(23)
+        r.mm()                       # paste expansion
+        p.mask_manual = r.mm()
+        r.skip(7)
+        r.u8()                       # paste mode
+        p.mask_mode = r.u8()         # 0 none, 1 rule, 2 manual
         r.end_subrecord()
         p.hole_shape, p.slot_len, p.slot_rotation = 0, 0.0, 0.0
+        p.top_alt = p.bot_alt = 0
+        p.top_corner = p.bot_corner = 0
         n6 = r.subrecord()
         if n6 >= 596:
             r.skip(29 * 4 * 2 + 29 + 1)
             p.hole_shape = r.u8()
             p.slot_len = r.mm()
             p.slot_rotation = r.f64()
+            r.skip(32 * 4 * 2 + 1)    # hole offsets
+            alt = r.d[r.p:r.p + 32]
+            r.skip(32)
+            corner = r.d[r.p:r.p + 32]
+            p.top_alt, p.bot_alt = alt[0], alt[31]
+            p.top_corner, p.bot_corner = corner[0], corner[31]
         r.end_subrecord()
-        del n5
         return p
 
     # -- Vias6 ---------------------------------------------------------------
@@ -500,26 +563,41 @@ class PcbDocReader:
             if r.u8() != 3:
                 self.doc.warnings.append("Vias6: unexpected record type")
                 break
-            r.subrecord()
-            r.skip(13)
+            n = r.subrecord()
             v = Via()
+            r.skip(1)
+            flags1 = r.u8()
+            v.tent_top = (flags1 & 0x20) != 0
+            v.tent_bottom = (flags1 & 0x40) != 0
+            r.skip(11)
             v.x, v.y = r.mm(), r.mm()
             v.diameter = r.mm()
             v.hole = r.mm()
+            v.layer_start, v.layer_end = r.u8(), r.u8()
+            v.mask_manual, v.mask_expansion = False, None
+            if n > 74:
+                r.skip(1 + 4 + 1 + 1 + 4 + 4 + 4 + 4)
+                v.mask_expansion = r.mm()
+                r.skip(8)
+                v.mask_manual = (r.u8() & 0x02) != 0
             r.end_subrecord()
             self.doc.vias.append(v)
 
-    # -- Regions (board cutouts) --------------------------------------------
+    # -- Regions (board cutouts, copper/mask/silk regions, polygon pours) ----
     def _region(self, r, extended):
         r.u8()
         r.subrecord()
-        r.skip(5)
-        r.u16()                      # polygon
-        comp = r.u16()
+        g = {}
+        g["layer"] = r.u8()
+        r.skip(1)
+        g["keepout"] = r.u8() == 2
+        r.u16()                      # net
+        g["polygon"] = r.u16()
+        g["component"] = r.u16()
         r.skip(5)
         holecount = r.u16()
         r.skip(2)
-        pr = r.props()
+        g["props"] = r.props()
         n = r.u32()
         verts = []
         if extended:
@@ -530,26 +608,41 @@ class PcbDocReader:
                 rad = r.mm()
                 a1, a2 = r.f64(), r.f64()
                 verts.append((is_arc, pos, ctr, rad, a1, a2))
+            if verts and math.dist(verts[0][1], verts[-1][1]) < 1e-6 and not verts[-1][0]:
+                verts = verts[:-1]
         else:
             for _ in range(n):
                 x, y = r.f64(), r.f64()
                 verts.append((False, (x * INTERNAL_TO_MM, y * INTERNAL_TO_MM), (0, 0), 0, 0, 0))
+        holes = []
+        for _ in range(holecount):
+            if r.sub_remaining() < 4:
+                break
+            hn = r.u32()
+            hv = []
+            for _ in range(hn):
+                x, y = r.f64(), r.f64()
+                hv.append((False, (x * INTERNAL_TO_MM, y * INTERNAL_TO_MM), (0, 0), 0, 0, 0))
+            holes.append(hv)
         r.end_subrecord()
-        return pr, comp, holecount, verts
+        g["verts"], g["holes"] = verts, holes
+        return g
 
-    def _cutouts(self):
+    def _regions(self):
         seen = set()
         for name, ext in (("ShapeBasedRegions6", True), ("Regions6", False)):
             r = Reader(self._stream(name))
             while r.remaining() >= 4:
                 try:
-                    pr, comp, _, verts = self._region(r, ext)
+                    g = self._region(r, ext)
                 except (struct.error, IndexError) as e:
                     self.doc.warnings.append("%s parse stopped: %s" % (name, e))
                     break
-                if fnum(pr.get("KIND")) == 0 and fbool(pr.get("ISBOARDCUTOUT")):
-                    if ext and verts and math.dist(verts[0][1], verts[-1][1]) < 1e-6 and not verts[-1][0]:
-                        verts = verts[:-1]
+                pr, verts = g["props"], g["verts"]
+                kind = int(fnum(pr.get("KIND")))
+                if kind != 0 or len(verts) < 2:
+                    continue
+                if fbool(pr.get("ISBOARDCUTOUT")):
                     key = tuple(round(v[1][0], 3) for v in verts[:4])
                     if key in seen:
                         continue          # same cutout appears in both streams
@@ -557,6 +650,152 @@ class PcbDocReader:
                     segs = _vertices_to_segments(verts)
                     if len(segs) >= 2:
                         self.doc.cutouts.append(segs)
+                    continue
+                if g["keepout"]:
+                    continue
+                pour = g["polygon"] != 0xFFFF
+                # Poured polygon fills live in Regions6; solid regions in
+                # ShapeBasedRegions6 (which also echoes the pours: skip those).
+                if (name == "Regions6") != pour:
+                    continue
+                segs = _vertices_to_segments(verts)
+                if len(segs) < 2:
+                    continue
+                holes = [_vertices_to_segments(h) for h in g["holes"] if len(h) > 2]
+                self.doc.add_shape(g["layer"], ("poly", segs, holes))
+
+    # -- Tracks6 / Arcs6 / Fills6 -------------------------------------------
+    def _prim_header(self, r):
+        layer = r.u8()
+        r.skip(1)
+        keepout = r.u8() == 2
+        r.u16()                      # net
+        r.u16()                      # polygon
+        comp = r.u16()
+        r.skip(4)
+        return layer, keepout, comp
+
+    def _tracks(self):
+        r = Reader(self._stream("Tracks6"))
+        while r.remaining() >= 4:
+            if r.u8() != 4:
+                self.doc.warnings.append("Tracks6: unexpected record type")
+                break
+            r.subrecord()
+            layer, keepout, _ = self._prim_header(r)
+            x1, y1, x2, y2, w = r.mm(), r.mm(), r.mm(), r.mm(), r.mm()
+            r.end_subrecord()
+            if not keepout and w > 0:
+                self.doc.add_shape(layer, ("track", x1, y1, x2, y2, w))
+
+    def _arcs(self):
+        r = Reader(self._stream("Arcs6"))
+        while r.remaining() >= 4:
+            if r.u8() != 1:
+                self.doc.warnings.append("Arcs6: unexpected record type")
+                break
+            r.subrecord()
+            layer, keepout, _ = self._prim_header(r)
+            cx, cy, rad = r.mm(), r.mm(), r.mm()
+            sa, ea = r.f64(), r.f64()
+            w = r.mm()
+            r.end_subrecord()
+            if not keepout and w > 0:
+                self.doc.add_shape(layer, ("arc", cx, cy, rad, sa, ea, w))
+
+    def _fills(self):
+        r = Reader(self._stream("Fills6"))
+        while r.remaining() >= 4:
+            if r.u8() != 6:
+                self.doc.warnings.append("Fills6: unexpected record type")
+                break
+            r.subrecord()
+            layer, keepout, _ = self._prim_header(r)
+            x1, y1, x2, y2 = r.mm(), r.mm(), r.mm(), r.mm()
+            rot = r.f64()
+            r.end_subrecord()
+            if keepout:
+                continue
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            hw, hh = abs(x2 - x1) / 2, abs(y2 - y1) / 2
+            a = math.radians(rot)
+            ca, sa = math.cos(a), math.sin(a)
+            pts = [(cx + dx * ca - dy * sa, cy + dx * sa + dy * ca)
+                   for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
+            segs = [Segment(pts[i], pts[(i + 1) % 4]) for i in range(4)]
+            self.doc.add_shape(layer, ("poly", segs, []))
+
+    # -- Texts6 --------------------------------------------------------------
+    def _texts(self):
+        table = {}
+        r = Reader(self._stream("WideStrings6"))
+        while r.remaining() >= 8:
+            idx, ln = r.u32(), r.u32()
+            raw = r.d[r.p:r.p + ln]
+            r.skip(ln)
+            table[idx] = raw[:-2].decode("utf-16-le", "replace") if ln > 2 else ""
+        r = Reader(self._stream("Texts6"))
+        while r.remaining() >= 4:
+            if r.u8() != 5:
+                self.doc.warnings.append("Texts6: unexpected record type")
+                break
+            n = r.subrecord()
+            t = Text()
+            t.layer = r.u8()
+            r.skip(6)
+            t.component = r.u16()
+            if t.component == 0xFFFF:
+                t.component = -1
+            r.skip(4)
+            t.x, t.y = r.mm(), r.mm()
+            t.height = r.mm()
+            r.u16()
+            t.rotation = r.f64()
+            t.mirrored = r.u8() != 0
+            t.stroke_width = r.mm()
+            t.is_comment = t.is_designator = t.bold = t.italic = t.inverted = False
+            t.font_type, t.font_name = 0, ""
+            widx = None
+            if n >= 123:
+                t.is_comment = r.u8() != 0
+                t.is_designator = r.u8() != 0
+                r.skip(1)
+                t.font_type = r.u8()
+                t.bold = r.u8() != 0
+                t.italic = r.u8() != 0
+                t.font_name = r.d[r.p:r.p + 64].decode("utf-16-le", "replace").split("\0")[0]
+                r.skip(64)
+                t.inverted = r.u8() != 0
+                r.mm()
+                widx = r.u32()
+            r.end_subrecord()
+            r.subrecord()
+            ln = r.u8() if r.sub_remaining() > 0 else 0
+            legacy = r.d[r.p:r.p + ln].decode("latin-1")
+            r.end_subrecord()
+            t.text = table.get(widx, legacy) if widx is not None else legacy
+            t.text = t.text.replace("\r\n", "\n")
+            if t.font_type != 1:
+                t.inverted = False
+            self.doc.texts.append(t)
+
+    # -- Rules6 (solder mask expansion) -------------------------------------
+    def _rules(self):
+        r = Reader(self._stream("Rules6"))
+        best = None
+        while r.remaining() >= 6:
+            r.skip(2)
+            pr = r.props()
+            if pr.get("RULEKIND") != "SolderMaskExpansion" or not fbool(pr.get("ENABLED"), True):
+                continue
+            prio = int(fnum(pr.get("PRIORITY"), 1))
+            scope = pr.get("SCOPE1EXPRESSION", "All").strip().upper()
+            # prefer the board-wide rule ("All"), else the lowest-priority one
+            rank = (0 if scope == "ALL" else 1, -prio)
+            if best is None or rank < best[0]:
+                best = (rank, unit_mm(pr.get("EXPANSION"), 0.1016))
+        if best:
+            self.doc.mask_expansion = best[1]
 
     # -- ComponentBodies6 ----------------------------------------------------
     def _bodies(self):

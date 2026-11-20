@@ -21,10 +21,12 @@ if _LIB not in sys.path:
 
 import importlib  # noqa: E402
 import altium_pcbdoc  # noqa: E402
+import layer_geometry  # noqa: E402
+import fusion_layers  # noqa: E402
 import fusion_builder  # noqa: E402
 
-importlib.reload(altium_pcbdoc)
-importlib.reload(fusion_builder)
+for _m in (altium_pcbdoc, layer_geometry, fusion_layers, fusion_builder):
+    importlib.reload(_m)
 
 CMD_ID = "altiumImporter_importPcbDoc"
 CMD_NAME = "Import Altium PCB"
@@ -93,6 +95,10 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             inputs.addBoolValueInput("placeholders", "Boxes for parts without a body", True, "", True)
             inputs.addValueInput("ph_height", "Default box height", "mm",
                                  adsk.core.ValueInput.createByReal(0.1))
+            inputs.addBoolValueInput("copper", "Outer copper layers", True, "", True)
+            inputs.addBoolValueInput("mask", "Solder mask", True, "", True)
+            inputs.addBoolValueInput("silk", "Silkscreen", True, "", True)
+            inputs.addBoolValueInput("silk_text", "Silkscreen text", True, "", True)
             inputs.addBoolValueInput("new_doc", "Create in a new design", True, "", True)
         except Exception:
             _err("Failed to start import:\n")
@@ -116,6 +122,10 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             opt.extruded_bodies = inp.itemById("extruded").value
             opt.placeholders = inp.itemById("placeholders").value
             opt.placeholder_height_mm = inp.itemById("ph_height").value * 10.0
+            opt.copper = inp.itemById("copper").value
+            opt.mask = inp.itemById("mask").value
+            opt.silk = inp.itemById("silk").value
+            opt.silk_text = inp.itemById("silk_text").value
             opt.new_document = inp.itemById("new_doc").value
 
             progress = _ui.createProgressDialog()

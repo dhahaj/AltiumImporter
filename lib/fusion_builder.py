@@ -16,9 +16,13 @@ import tempfile
 import adsk.core
 import adsk.fusion
 
+import layer_geometry
+
 CM = 0.1  # mm -> cm
 
 BOARD_RGB = (24, 110, 60)
+CORE_RGB = (196, 180, 130)       # bare FR-4, seen at the edges under the mask
+SILK_RGB = (245, 245, 240)
 COPPER_RGB = (200, 140, 60)
 PLACEHOLDER_RGB = (60, 60, 60)
 
@@ -35,6 +39,20 @@ class Options:
         self.placeholder_height_mm = 1.0
         self.origin = "altium"          # 'altium' | 'board' | 'absolute'
         self.new_document = True
+        # thin layers
+        self.copper = True
+        self.mask = True
+        self.silk = True
+        self.silk_text = True
+        self.mask_thickness_mm = 0.02
+        self.silk_thickness_mm = 0.015
+        self.mask_rgb = (20, 100, 45)
+        self.mask_opacity = 0.92
+        self.debug_log = None           # path: append timestamped progress lines
+
+    @property
+    def any_layers(self):
+        return self.copper or self.mask or self.silk
 
 
 # ----------------------------------------------------------------------------
@@ -131,6 +149,15 @@ class Builder:
         return adsk.core.Point3D.create((x - self.ox) * CM, (y - self.oy) * CM, z * CM)
 
     def step(self, msg, value=None):
+        if self.opt.debug_log:
+            import time
+            if not hasattr(self, "_t0"):
+                self._t0 = time.time()
+            try:
+                with open(self.opt.debug_log, "a") as f:
+                    f.write("%7.1f  %s\n" % (time.time() - self._t0, msg))
+            except OSError:
+                pass
         if self.progress:
             if value is not None:
                 self.progress.progressValue = int(value)
@@ -256,7 +283,10 @@ class Builder:
         self.step("Building board outline", 5)
         self.build_board()
 
-        self.step("Building components", 30)
+        if self.opt.any_layers:
+            self.build_layers()
+
+        self.step("Building components", 60 if self.opt.any_layers else 30)
         self.build_components()
 
         if self._tmpdir:
@@ -274,6 +304,148 @@ class Builder:
                 pass
         app.activeViewport.fit()
         return self.log
+
+    # -- layer heights ---------------------------------------------------------
+    def core_z(self):
+        if self.opt.copper:
+            return self.doc.copper_bottom, self.t - self.doc.copper_top
+        return 0.0, self.t
+
+    def add_temp_body(self, comp, temp, name, rgb=None, opacity=None, appearance=None):
+        if temp is None:
+            return None
+        design = self.design
+        if design.designType == adsk.fusion.DesignTypes.DirectDesignType:
+            body = comp.bRepBodies.add(temp)
+        else:
+            bf = comp.features.baseFeatures.add()
+            bf.startEdit()
+            body = comp.bRepBodies.add(temp, bf)
+            bf.finishEdit()
+        body.name = name
+        ap = appearance or (self.appearance(rgb) if rgb else None)
+        if ap:
+            body.appearance = ap
+        if opacity is not None and opacity < 1:
+            try:
+                body.opacity = opacity
+            except Exception:
+                pass
+        return body
+
+    def library_appearance(self, name):
+        if name in self._appearances:
+            return self._appearances[name]
+        found = None
+        for lib in self.app.materialLibraries:
+            try:
+                if lib.appearances.count == 0:
+                    continue
+                found = lib.appearances.itemByName(name)
+            except Exception:
+                found = None
+            if found:
+                break
+        if found:
+            try:
+                found = self.design.appearances.itemByName(name) or \
+                    self.design.appearances.addByCopy(found, name)
+            except Exception:
+                pass
+        self._appearances[name] = found
+        return found
+
+    # -- copper / mask / silkscreen -------------------------------------------
+    def build_layers(self):
+        import fusion_layers
+        doc, opt = self.doc, self.opt
+        lb = fusion_layers.LayerBuilder(self)
+        comp = self.board_comp
+        t = self.t
+        cu = {"top": doc.copper_top, "bottom": doc.copper_bottom}
+        m, s = opt.mask_thickness_mm, opt.silk_thickness_mm
+        try:
+            drills = None
+            if opt.pad_holes or opt.via_holes:
+                self.step("Layers: drills", 32)
+                drills = lb.union_all(layer_geometry.drill_prims(doc, opt.pad_holes, opt.via_holes),
+                                      -1.0, t + 1.0)
+            outline = None
+            if opt.mask:
+                outline = lb.poly_solid(doc.outline, doc.cutouts if opt.cutouts else [], -1.0, t + 1.0)
+            gold = self.library_appearance("Gold - Polished")
+            for k, side in enumerate(("top", "bottom")):
+                base = 35 + k * 12
+                top = side == "top"
+                # z ranges (mm)
+                if top:
+                    zc = (t - cu[side], t)
+                    zm = (t - cu[side], t + m)
+                    zs = (t + m, t + m + s)
+                else:
+                    zc = (0.0, cu[side])
+                    zm = (-m, cu[side])
+                    zs = (-m - s, -m)
+                if not opt.copper:
+                    zc = (t, t + cu[side]) if top else (-cu[side], 0.0)
+                    zm = (t, t + m) if top else (-m, 0.0)
+                    zs = (t + m, t + m + s) if top else (-m - s, -m)
+                label = "Top" if top else "Bottom"
+
+                if opt.copper:
+                    prims = layer_geometry.copper_prims(doc, side)
+                    self.step("%s copper: %d shapes" % (label, len(prims)), base)
+                    parts = lb.union_layer(prims, zc[0], zc[1],
+                                           lambda i, n: self.step("%s copper %d/%d" % (label, i, n), base))
+                    for j, part in enumerate(parts):
+                        self.step("%s copper: drilling %d/%d" % (label, j + 1, len(parts)), base + 2)
+                        part = lb.subtract(part, drills)
+                        self.add_temp_body(comp, part, "%s copper" % label if j == 0
+                                           else "%s copper pour %d" % (label, j),
+                                           COPPER_RGB, appearance=gold)
+
+                openings = None
+                if opt.mask or opt.silk:
+                    prims = layer_geometry.mask_opening_prims(doc, side)
+                    openings = lb.union_all(prims, min(zc[0], zm[0], zs[0]) - 0.1,
+                                            max(zc[1], zm[1], zs[1]) + 0.1)
+
+                if opt.mask and outline is not None:
+                    self.step("%s solder mask" % label, base + 4)
+                    mask = lb.tb.copy(outline)
+                    # trim the tall outline prism to the mask's height range
+                    slab = lb._box_bounds(zm[0], zm[1])
+                    lb.tb.booleanOperation(mask, slab, fusion_layers.INTERSECT)
+                    mask = lb.subtract(mask, openings)
+                    # The mask overlaps the copper volume instead of being cut
+                    # around it: same look (copper shows through the slightly
+                    # translucent mask), far fewer faces to boolean.
+                    mask = lb.subtract(mask, drills)
+                    self.add_temp_body(comp, mask, "%s solder mask" % label, opt.mask_rgb,
+                                       opacity=opt.mask_opacity)
+
+                if opt.silk:
+                    prims = layer_geometry.silk_prims(doc, side)
+                    texts = layer_geometry.silk_texts(doc, side) if opt.silk_text else []
+                    self.step("%s silkscreen: %d shapes, %d texts" % (label, len(prims), len(texts)),
+                              base + 8)
+                    extra = []
+                    for i, tx in enumerate(texts):
+                        try:
+                            extra.append(lb.text_solid(tx, zs[0], zs[1]))
+                        except Exception as e:
+                            lb._fail("text", "%r: %s" % (tx.text, str(e)[:80]))
+                        if i % 20 == 0:
+                            self.step("%s silkscreen text %d/%d" % (label, i, len(texts)), base + 8)
+                    for j, part in enumerate(lb.union_all(prims, zs[0], zs[1], extra=extra)):
+                        part = lb.subtract(part, openings)     # fabs clip silk off pads
+                        part = lb.subtract(part, drills)
+                        self.add_temp_body(comp, part, "%s silkscreen" % label if j == 0
+                                           else "%s silkscreen %d" % (label, j + 1), SILK_RGB)
+            if lb.failed:
+                self.log.append("Layers: %d shapes could not be built: %s" % (lb.failed, lb.fail_summary()))
+        finally:
+            lb.close()
 
     # -- board ---------------------------------------------------------------
     def build_board(self):
@@ -293,12 +465,20 @@ class Builder:
             raise RuntimeError("Board outline did not form a closed profile")
         prof = max((sk.profiles.item(i) for i in range(sk.profiles.count)),
                    key=lambda p: p.areaProperties().area)
-        ext = comp.features.extrudeFeatures.addSimple(
-            prof, adsk.core.ValueInput.createByReal(self.t * CM),
-            adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        # With copper layers on, the core spans the stackup minus outer copper
+        # so the copper bodies sit inside the stated board thickness.
+        z0, z1 = self.core_z()
+        ei = comp.features.extrudeFeatures.createInput(
+            prof, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        if z0 > 1e-9:
+            ei.startExtent = adsk.fusion.OffsetStartDefinition.create(
+                adsk.core.ValueInput.createByReal(z0 * CM))
+        ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal((z1 - z0) * CM))
+        ext = comp.features.extrudeFeatures.add(ei)
         board = ext.bodies.item(0)
-        board.name = "PCB"
-        ap = self.appearance(BOARD_RGB)
+        board.name = "PCB core" if self.opt.copper else "PCB"
+        self.board_comp = comp
+        ap = self.appearance(CORE_RGB if self.opt.mask else BOARD_RGB)
         if ap:
             board.appearance = ap
 
@@ -469,9 +649,6 @@ class Builder:
         path = os.path.join(self._tmpdir, "%d_%s" % (model.index, fname))
         with open(path, "wb") as f:
             f.write(model.step)
-        # Import at identity first: importing into an already-transformed
-        # occurrence bakes that transform into the component's contents, which
-        # then gets applied twice for every re-used instance.
         occ = comp.occurrences.addNewComponent(mat)
         mc = occ.component
         mc.name = safe_name(os.path.splitext(model.name)[0])
