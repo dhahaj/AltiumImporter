@@ -87,6 +87,8 @@ You can cancel from the progress dialog at any time, and the geometry built so f
 AltiumImporter/
 ├── AltiumImporter.py        # add-in entry point: command, dialog, progress
 ├── AltiumImporter.manifest
+├── icon.svg                 # add-in icon (Scripts and Add-Ins list)
+├── resources/               # toolbar button PNGs rendered from icon.svg
 └── lib/
     ├── altium_pcbdoc.py     # pure-Python PcbDoc reader (no Fusion dependency)
     ├── layer_geometry.py    # pure-Python copper/mask/silk shapes per layer
