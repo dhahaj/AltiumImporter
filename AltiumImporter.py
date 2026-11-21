@@ -80,11 +80,34 @@ def _err(prefix=""):
         _ui.messageBox(prefix + traceback.format_exc(), CMD_NAME)
 
 
-def _pick_file():
+# (id, label, default) for the dialog's check boxes, in display order.
+# The defaults apply until an import has been run; after that the dialog
+# opens with whatever was used last (saved in settings.json).
+BOOL_OPTIONS = [
+    ("pad_holes", "Pad holes / slots", True),
+    ("via_holes", "Via holes (slow on dense boards)", False),
+    ("cutouts", "Board cutouts", True),
+    ("step_models", "Embedded STEP models", True),
+    ("extruded", "Altium extruded 3D bodies", True),
+    ("placeholders", "Boxes for parts without a body", True),
+    ("copper", "Outer copper layers", True),
+    ("mask", "Solder mask", True),
+    ("silk", "Silkscreen", True),
+    ("silk_text", "Silkscreen text", True),
+    ("new_doc", "Create in a new design", True),
+]
+ORIGINS = [("altium", "Altium board origin"),
+           ("board", "Board lower-left corner"),
+           ("absolute", "Altium absolute origin")]
+
+
+def _pick_file(start_dir=None):
     dlg = _ui.createFileDialog()
     dlg.title = "Open Altium PCB"
     dlg.filter = "Altium PCB (*.PcbDoc;*.pcbdoc);;All files (*.*)"
     dlg.isMultiSelectEnabled = False
+    if start_dir and os.path.isdir(start_dir):
+        dlg.initialDirectory = start_dir
     if dlg.showOpen() != adsk.core.DialogResults.DialogOK:
         return None
     return dlg.filename
@@ -105,9 +128,11 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             _handlers.append(on_validate)
             _state["doc"] = None
 
-            path = _pick_file()
+            prefs = _load_settings()
+            path = _pick_file(prefs.get("last_folder"))
             doc = None
             if path:
+                _save_settings(last_folder=os.path.dirname(path))
                 try:
                     doc = altium_pcbdoc.read_pcbdoc(path)
                 except altium_pcbdoc.AltiumParseError as e:
@@ -123,24 +148,37 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
                                           3, True)
             inputs.addValueInput("thickness", "Board thickness", "mm",
                                  adsk.core.ValueInput.createByReal(doc.thickness / 10.0))
+            saved = prefs.get("options", {})
+            if not isinstance(saved, dict):
+                saved = {}
+
+            def flag(oid, default):
+                v = saved.get(oid, default)
+                return v if isinstance(v, bool) else default
+
             origin = inputs.addDropDownCommandInput(
                 "origin", "Origin", adsk.core.DropDownStyles.TextListDropDownStyle)
-            origin.listItems.add("Altium board origin", True)
-            origin.listItems.add("Board lower-left corner", False)
-            origin.listItems.add("Altium absolute origin", False)
-            inputs.addBoolValueInput("pad_holes", "Pad holes / slots", True, "", True)
-            inputs.addBoolValueInput("via_holes", "Via holes (slow on dense boards)", True, "", False)
-            inputs.addBoolValueInput("cutouts", "Board cutouts", True, "", True)
-            inputs.addBoolValueInput("step_models", "Embedded STEP models", True, "", True)
-            inputs.addBoolValueInput("extruded", "Altium extruded 3D bodies", True, "", True)
-            inputs.addBoolValueInput("placeholders", "Boxes for parts without a body", True, "", True)
+            last_origin = saved.get("origin", ORIGINS[0][0])
+            if last_origin not in [o[0] for o in ORIGINS]:
+                last_origin = ORIGINS[0][0]
+            for key, label in ORIGINS:
+                origin.listItems.add(label, key == last_origin)
+            bools = dict((oid, (label, default)) for oid, label, default in BOOL_OPTIONS)
+
+            def add_bool(oid):
+                label, default = bools[oid]
+                inputs.addBoolValueInput(oid, label, True, "", flag(oid, default))
+
+            for oid in ("pad_holes", "via_holes", "cutouts", "step_models", "extruded",
+                        "placeholders"):
+                add_bool(oid)
+            ph = saved.get("ph_height_mm", 1.0)
+            if not isinstance(ph, (int, float)) or not 0 < ph < 100:
+                ph = 1.0
             inputs.addValueInput("ph_height", "Default box height", "mm",
-                                 adsk.core.ValueInput.createByReal(0.1))
-            inputs.addBoolValueInput("copper", "Outer copper layers", True, "", True)
-            inputs.addBoolValueInput("mask", "Solder mask", True, "", True)
-            inputs.addBoolValueInput("silk", "Silkscreen", True, "", True)
-            inputs.addBoolValueInput("silk_text", "Silkscreen text", True, "", True)
-            prefs = _load_settings()
+                                 adsk.core.ValueInput.createByReal(ph / 10.0))
+            for oid in ("copper", "mask", "silk", "silk_text"):
+                add_bool(oid)
             last = prefs.get("colors", fusion_builder.COLOR_PRESETS[0][0])
             names = [p[0] for p in fusion_builder.COLOR_PRESETS] + [CUSTOM_COLORS]
             if last not in names:
@@ -157,7 +195,7 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
                                             prefs.get("silk_color", "#F5F5F0"))
             sc.tooltip = "Hex (#F5F5F0) or R,G,B (245,245,240)"
             _custom_visible(inputs)
-            inputs.addBoolValueInput("new_doc", "Create in a new design", True, "", True)
+            add_bool("new_doc")
         except Exception:
             _err("Failed to start import:\n")
 
@@ -194,7 +232,7 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             inp = args.command.commandInputs
             opt = fusion_builder.Options()
             opt.thickness_mm = inp.itemById("thickness").value * 10.0
-            opt.origin = ["altium", "board", "absolute"][inp.itemById("origin").selectedItem.index]
+            opt.origin = ORIGINS[inp.itemById("origin").selectedItem.index][0]
             opt.pad_holes = inp.itemById("pad_holes").value
             opt.via_holes = inp.itemById("via_holes").value
             opt.cutouts = inp.itemById("cutouts").value
@@ -207,6 +245,9 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             opt.silk = inp.itemById("silk").value
             opt.silk_text = inp.itemById("silk_text").value
             opt.new_document = inp.itemById("new_doc").value
+            _save_settings(options=dict(
+                [(oid, inp.itemById(oid).value) for oid, _, _ in BOOL_OPTIONS] +
+                [("origin", opt.origin), ("ph_height_mm", opt.placeholder_height_mm)]))
             choice = inp.itemById("colors").selectedItem.name
             if choice == CUSTOM_COLORS:
                 m_txt = inp.itemById("mask_color").value
