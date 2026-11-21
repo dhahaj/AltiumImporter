@@ -9,5 +9,6 @@
   "version": "0.1.0",
   "runOnStartup": true,
   "supportedOS": "windows|mac",
-  "editEnabled": true
+  "editEnabled": true,
+  "iconFilename": "icon.svg"
 }
