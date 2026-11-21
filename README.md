@@ -60,7 +60,7 @@ You can also copy the folder into Fusion's add-in directory and restart Fusion:
    - **Pad holes / Via holes / Board cutouts**
    - **Embedded STEP models / Altium extruded 3D bodies / Boxes for parts without a body**
    - **Outer copper layers / Solder mask / Silkscreen / Silkscreen text**: all on by default. Turn them off for a plain mechanical model; they add roughly 30 to 90 seconds on a typical board.
-   - **Mask / silkscreen color**: Green / white (default), Black / white, White / black, Red / white, Purple / white, Blue / white, Yellow / black or Matte green / white. **Custom...** shows two boxes that take a hex code (`#1A6B2D`) or `R,G,B`. With the mask turned off, the bare board takes the mask color.
+   - **Mask / silkscreen color**: Green / white (default), Black / white, White / black, Red / white, Purple / white, Blue / white, Yellow / black or Matte green / white. **Custom...** shows a color picker (click Mask or Silkscreen, then drag in the square and hue bar or click a swatch, with a live board preview) plus two boxes that take a hex code (`#1A6B2D`) or `R,G,B`. The picker and the boxes stay in sync. With the mask turned off, the bare board takes the mask color.
    - **Create in a new design**: on by default. The new design uses direct modeling (no timeline), which is much faster with hundreds of parts.
 
 The dialog remembers what you used last: every option, the color choice and the folder the file picker opens in are saved to `settings.json` in the add-in folder after each import. Board thickness always starts from the file's stackup, since it differs per board. Delete `settings.json` to go back to the defaults.

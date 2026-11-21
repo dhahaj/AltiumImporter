@@ -39,7 +39,7 @@ WORKSPACE_ID = "FusionSolidEnvironment"
 _app = None
 _ui = None
 _handlers = []
-_state = {"doc": None, "path": None}
+_state = {"doc": None, "path": None, "inputs": None, "html_colors": None}
 _SETTINGS = os.path.join(_HERE, "settings.json")
 
 
@@ -65,14 +65,39 @@ def _save_settings(**kw):
 CUSTOM_COLORS = "Custom..."
 
 
+PICKER_HTML = os.path.join(_HERE, "html", "color_picker.html")
+
+
 def _custom_visible(inputs):
     dd = inputs.itemById("colors")
     custom = dd is not None and dd.selectedItem is not None and \
         dd.selectedItem.name == CUSTOM_COLORS
-    for cid in ("mask_color", "silk_color"):
+    for cid in ("mask_color", "silk_color", "color_picker"):
         ci = inputs.itemById(cid)
         if ci:
             ci.isVisible = custom
+
+
+def _picker_colors(inputs):
+    """Current custom colours as {'mask': '#RRGGBB', 'silk': '#RRGGBB'}."""
+    out = {}
+    for key, cid, default in (("mask", "mask_color", (26, 107, 45)),
+                              ("silk", "silk_color", (245, 245, 240))):
+        ci = inputs.itemById(cid) if inputs else None
+        rgb = fusion_builder.parse_color(ci.value) if ci else None
+        out[key] = fusion_builder.color_hex(rgb or default)
+    return out
+
+
+def _push_to_picker(inputs):
+    """Send the hex boxes' colours to the picker, unless it sent them itself."""
+    bi = inputs.itemById("color_picker") if inputs else None
+    if bi is None:
+        return
+    cols = _picker_colors(inputs)
+    if cols != _state.get("html_colors"):
+        _state["html_colors"] = cols
+        bi.sendInfoToHTML("set", json.dumps(cols))
 
 
 def _err(prefix=""):
@@ -126,6 +151,9 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             on_validate = ValidateHandler()
             cmd.validateInputs.add(on_validate)
             _handlers.append(on_validate)
+            on_html = PickerHandler()
+            cmd.incomingFromHTML.add(on_html)
+            _handlers.append(on_html)
             _state["doc"] = None
 
             prefs = _load_settings()
@@ -194,6 +222,16 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             sc = inputs.addStringValueInput("silk_color", "Silkscreen color",
                                             prefs.get("silk_color", "#F5F5F0"))
             sc.tooltip = "Hex (#F5F5F0) or R,G,B (245,245,240)"
+            _state["inputs"], _state["html_colors"] = inputs, None
+            if os.path.isfile(PICKER_HTML):
+                try:
+                    # Fusion prefixes "file:///" itself and URL-encodes backslashes
+                    # (ERR_INVALID_URL), so hand it a forward-slash path.
+                    bi = inputs.addBrowserCommandInput("color_picker", "",
+                                                       PICKER_HTML.replace("\\", "/"), 300, 300)
+                    bi.tooltip = "Pick the mask or silkscreen color"
+                except Exception:
+                    pass   # older Fusion without browser inputs: hex boxes still work
             _custom_visible(inputs)
             add_bool("new_doc")
         except Exception:
@@ -205,6 +243,35 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
         try:
             if args.input.id == "colors":
                 _custom_visible(args.inputs)
+            elif args.input.id in ("mask_color", "silk_color"):
+                if fusion_builder.parse_color(args.input.value):
+                    _push_to_picker(args.inputs)
+        except Exception:
+            pass
+
+
+class PickerHandler(adsk.core.HTMLEventHandler):
+    """Messages from html/color_picker.html."""
+    def notify(self, args):
+        try:
+            inputs = _state.get("inputs")
+            if args.action == "ready":
+                cols = _picker_colors(inputs)
+                _state["html_colors"] = cols
+                args.returnData = json.dumps(cols)
+            elif args.action == "colors":
+                cols = json.loads(args.data)
+                new = {}
+                for key, cid in (("mask", "mask_color"), ("silk", "silk_color")):
+                    rgb = fusion_builder.parse_color(cols.get(key))
+                    if rgb:
+                        new[key] = fusion_builder.color_hex(rgb)
+                old = _picker_colors(inputs)
+                _state["html_colors"] = dict(old, **new)
+                for key, cid in (("mask", "mask_color"), ("silk", "silk_color")):
+                    if key in new and new[key] != old[key]:
+                        inputs.itemById(cid).value = new[key]
+                args.returnData = "OK"
         except Exception:
             pass
 
@@ -227,6 +294,7 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
         progress = None
         try:
             doc = _state["doc"]
+            _state["inputs"] = None
             if not doc:
                 return
             inp = args.command.commandInputs
