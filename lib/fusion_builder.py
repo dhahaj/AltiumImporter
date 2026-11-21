@@ -416,7 +416,7 @@ class Builder:
                                       -1.0, t + 1.0)
             outline = None
             if opt.mask:
-                outline = lb.poly_solid(doc.outline, doc.cutouts if opt.cutouts else [], -1.0, t + 1.0)
+                outline, outline_drilled = self._mask_base(lb)
             gold = self.library_appearance("Gold - Polished")
             for k, side in enumerate(("top", "bottom")):
                 base = 35 + k * 12
@@ -456,15 +456,13 @@ class Builder:
 
                 if opt.mask and outline is not None:
                     self.step("%s solder mask" % label, base + 4)
-                    mask = lb.tb.copy(outline)
-                    # trim the tall outline prism to the mask's height range
-                    slab = lb._box_bounds(zm[0], zm[1])
-                    lb.tb.booleanOperation(mask, slab, fusion_layers.INTERSECT)
+                    mask = self._mask_slab(lb, outline, zm[0], zm[1])
                     mask = lb.subtract(mask, openings)
                     # The mask overlaps the copper volume instead of being cut
                     # around it: same look (copper shows through the slightly
                     # translucent mask), far fewer faces to boolean.
-                    mask = lb.subtract(mask, drills)
+                    if not outline_drilled:
+                        mask = lb.subtract(mask, drills)
                     self.add_temp_body(comp, mask, "%s solder mask" % label, opt.mask_rgb,
                                        opacity=opt.mask_opacity)
 
@@ -493,6 +491,47 @@ class Builder:
                 self.log.append("Layers: %d shapes could not be built: %s" % (lb.failed, lb.fail_summary()))
         finally:
             lb.close()
+
+    def _mask_base(self, lb):
+        """Solid the solder mask is cut from, plus whether it is already drilled.
+
+        Prefer a copy of the board body itself: it is the same shape the
+        board sketch produced (any outline, arcs, notches, cutouts) and
+        already has the holes in it. Rebuilding the outline as a face with
+        cutouts as inner wires broke on boards whose cutouts touch the edge
+        or whose outline Fusion could only close as a sketch profile.
+        """
+        body = getattr(self, "board_body", None)
+        if body is not None and body.isValid:
+            try:
+                return lb.tb.copy(body), self.board_drilled
+            except Exception as e:
+                self.log.append("Mask: board copy failed (%s), rebuilding outline" % str(e)[:80])
+        doc, t = self.doc, self.t
+        base = lb.poly_solid(doc.outline, [], -1.0, t + 1.0)
+        if base is not None and self.opt.cutouts and doc.cutouts:
+            for loop in doc.cutouts:
+                lb.subtract(base, lb.poly_solid(loop, [], -2.0, t + 2.0))
+        return base, False
+
+    def _mask_slab(self, lb, base, z0, z1):
+        """Copy of base squeezed/moved in z so it spans z0..z1 (mm)."""
+        mask = lb.tb.copy(base)
+        bb = mask.boundingBox
+        bz0, bz1 = bb.minPoint.z, bb.maxPoint.z
+        if bz1 - bz0 > 1e-9:
+            s = (z1 - z0) * CM / (bz1 - bz0)
+            m = adsk.core.Matrix3D.create()
+            m.setWithArray([1, 0, 0, 0,
+                            0, 1, 0, 0,
+                            0, 0, s, z0 * CM - bz0 * s,
+                            0, 0, 0, 1])
+            if lb.tb.transform(mask, m):
+                return mask
+        # transform refused: trim a tall copy to the height range instead
+        import fusion_layers
+        lb.tb.booleanOperation(mask, lb._box_bounds(z0, z1), fusion_layers.INTERSECT)
+        return mask
 
     # -- board ---------------------------------------------------------------
     def build_board(self):
@@ -525,6 +564,8 @@ class Builder:
         board = ext.bodies.item(0)
         board.name = "PCB core" if self.opt.copper else "PCB"
         self.board_comp = comp
+        self.board_body = board
+        self.board_drilled = False
         ap = self.appearance(CORE_RGB if self.opt.mask else self.opt.mask_rgb)
         if ap:
             board.appearance = ap
@@ -564,6 +605,7 @@ class Builder:
             ei.participantBodies = [board]
             try:
                 comp.features.extrudeFeatures.add(ei)
+                self.board_drilled = True
             except Exception as e:  # keep going; holes are nice-to-have
                 self.log.append("Hole cut failed: %s" % e)
         cut.isVisible = False
