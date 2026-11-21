@@ -225,7 +225,10 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             _state["inputs"], _state["html_colors"] = inputs, None
             if os.path.isfile(PICKER_HTML):
                 try:
-                    bi = inputs.addBrowserCommandInput("color_picker", "", PICKER_HTML, 200, 200)
+                    # Fusion prefixes "file:///" itself and URL-encodes backslashes
+                    # (ERR_INVALID_URL), so hand it a forward-slash path.
+                    bi = inputs.addBrowserCommandInput("color_picker", "",
+                                                       PICKER_HTML.replace("\\", "/"), 200, 200)
                     bi.tooltip = "Pick the mask or silkscreen color"
                 except Exception:
                     pass   # older Fusion without browser inputs: hex boxes still work
