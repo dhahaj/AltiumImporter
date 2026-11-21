@@ -18,7 +18,7 @@
   .target .chip { width: 16px; height: 16px; border-radius: 3px; border: 1px solid rgba(0,0,0,.25); }
   .target .lbl { line-height: 1.1; }
   .target .hex { font-family: Consolas, monospace; color: #777; }
-  .sv { position: relative; height: 96px; border-radius: 4px; cursor: crosshair;
+  .sv { position: relative; height: 84px; border-radius: 4px; cursor: crosshair;
     border: 1px solid rgba(0,0,0,.2); }
   .sv .w, .sv .b { position: absolute; inset: 0; border-radius: 3px; }
   .sv .w { background: linear-gradient(to right, #fff, rgba(255,255,255,0)); }
@@ -30,17 +30,11 @@
     background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); }
   .hue .knob { position: absolute; top: -2px; width: 6px; height: 14px; margin-left: -3px;
     border-radius: 2px; background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.6); pointer-events: none; }
-  .row { display: flex; align-items: center; gap: 4px; margin-top: 6px; }
-  .sw { width: 17px; height: 17px; border-radius: 3px; border: 1px solid rgba(0,0,0,.25);
-    cursor: pointer; flex: none; }
-  .sw:hover { transform: scale(1.15); }
-  .board { position: relative; flex: 1; height: 34px; margin-left: 4px; border-radius: 4px;
-    overflow: hidden; border: 1px solid rgba(0,0,0,.3); }
-  .board .t { position: absolute; font: bold 9px Arial, sans-serif; letter-spacing: .5px; }
-  .board .pad { position: absolute; width: 8px; height: 8px; border-radius: 50%;
-    background: #d4af37; box-shadow: inset 0 0 0 2px #b8932a; }
-  .board .smd { position: absolute; width: 6px; height: 9px; background: #d4af37; }
-  .board .box { position: absolute; border: 1px solid; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 4px; margin-top: 6px; }
+  .sw { flex: 1; max-width: 30px; height: 18px; border-radius: 3px; border: 1px solid rgba(0,0,0,.25);
+    cursor: pointer; }
+  .sw:hover { transform: scale(1.12); }
+  .board { display: block; width: 100%; height: 118px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -55,17 +49,8 @@
   </div>
   <div class="sv" id="sv"><div class="w"></div><div class="b"></div><div class="ring" id="ring"></div></div>
   <div class="hue" id="hue"><div class="knob" id="knob"></div></div>
-  <div class="row" id="swatches">
-    <div class="board" id="board" title="Preview">
-      <div class="box" style="left:6px;top:7px;width:22px;height:18px"></div>
-      <div class="smd" style="left:10px;top:12px"></div><div class="smd" style="left:18px;top:12px"></div>
-      <div class="t" style="left:32px;top:3px">U1</div>
-      <div class="t" style="left:32px;top:18px">R12</div>
-      <div class="pad" style="right:22px;top:6px"></div><div class="pad" style="right:22px;top:19px"></div>
-      <div class="pad" style="right:9px;top:6px"></div><div class="pad" style="right:9px;top:19px"></div>
-      <div class="t" style="right:36px;top:11px">J3</div>
-    </div>
-  </div>
+  <div class="row" id="swatches"></div>
+  <svg class="board" id="board" viewBox="0 0 280 112" xmlns="http://www.w3.org/2000/svg"></svg>
 </div>
 <script>
 (function () {
@@ -102,6 +87,72 @@
     return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
   }
 
+  // ---- preview board (SVG, built once; paint() recolours it) ----
+  var GOLD = "#D4AF37", HOLE = "#2B2B2B";
+  function svgBoard() {
+    var o = [];
+    function el(t, a) { var s = "<" + t; for (var k in a) s += " " + k + '="' + a[k] + '"'; o.push(s + "/>"); }
+    function txt(x, y, t, sz, anchor) {
+      o.push('<text class="sf" x="' + x + '" y="' + y + '" font-size="' + (sz || 8) + '" font-family="Arial, sans-serif"' +
+             ' font-weight="bold" text-anchor="' + (anchor || "start") + '">' + t + "</text>");
+    }
+    el("rect", { "class": "m", x: 1, y: 1, width: 278, height: 110, rx: 8, stroke: "rgba(0,0,0,.35)", "stroke-width": 1 });
+    // copper traces under the mask: drawn in the mask colour, lightened
+    var tr = ["M118 40 H150 L160 30 H196", "M118 48 H146 L170 72 H214", "M118 56 H140 L150 66 V92 H214",
+              "M74 40 H46 V22 H34", "M74 48 H40 L34 54", "M86 70 V92 H122", "M98 70 V84 L104 90 H150",
+              "M240 22 V40 H228", "M240 52 V70"];
+    tr.forEach(function (d) {
+      el("path", { "class": "tm", d: d, fill: "none", "stroke-width": 3, "stroke-linecap": "round", "stroke-linejoin": "round" });
+      el("path", { d: d, fill: "none", stroke: "rgba(255,255,255,.16)", "stroke-width": 3, "stroke-linecap": "round", "stroke-linejoin": "round" });
+    });
+    // QFP U1
+    el("rect", { "class": "ss", x: 80, y: 30, width: 34, height: 34, fill: "none", "stroke-width": 1.2 });
+    el("circle", { "class": "sf", cx: 85, cy: 35, r: 1.6 });
+    for (var i = 0; i < 5; i++) {
+      var p = 84 + i * 6.5;
+      el("rect", { x: p - 1.3, y: 24, width: 2.6, height: 5, fill: GOLD });
+      el("rect", { x: p - 1.3, y: 65, width: 2.6, height: 5, fill: GOLD });
+      el("rect", { x: 74, y: p - 1.3, width: 5, height: 2.6, fill: GOLD });
+      el("rect", { x: 115, y: p - 1.3, width: 5, height: 2.6, fill: GOLD });
+    }
+    txt(97, 50, "U1", 9, "middle");
+    // 0805 parts
+    [[150, 18, "R12"], [196, 18, "C3"], [214, 60, "R7"]].forEach(function (c) {
+      var x = c[0], y = c[1];
+      el("rect", { "class": "ss", x: x - 2, y: y + 4, width: 24, height: 12, fill: "none", "stroke-width": 1 });
+      el("rect", { x: x + 1, y: y + 6, width: 6, height: 8, fill: GOLD });
+      el("rect", { x: x + 13, y: y + 6, width: 6, height: 8, fill: GOLD });
+      txt(x + 10, y + 1, c[2], 8, "middle");
+    });
+    // SOT-23 Q2
+    el("rect", { "class": "ss", x: 18, y: 64, width: 30, height: 20, fill: "none", "stroke-width": 1 });
+    el("rect", { x: 22, y: 78, width: 5, height: 7, fill: GOLD });
+    el("rect", { x: 39, y: 78, width: 5, height: 7, fill: GOLD });
+    el("rect", { x: 30.5, y: 63, width: 5, height: 7, fill: GOLD });
+    txt(33, 98, "Q2", 8, "middle");
+    // header J1
+    el("rect", { "class": "ss", x: 231, y: 12, width: 18, height: 70, fill: "none", "stroke-width": 1.2 });
+    for (var j = 0; j < 5; j++) {
+      var cy = 22 + j * 12.5;
+      if (j === 0) el("rect", { x: 234.5, y: cy - 5.5, width: 11, height: 11, fill: GOLD });
+      else el("circle", { cx: 240, cy: cy, r: 5.5, fill: GOLD });
+      el("circle", { cx: 240, cy: cy, r: 2.4, fill: HOLE });
+    }
+    txt(240, 94, "J1", 8, "middle");
+    // vias (tented) and mounting holes
+    [[34, 22], [34, 54], [196, 30], [170, 72], [150, 92], [122, 92], [228, 40]].forEach(function (v) {
+      el("circle", { cx: v[0], cy: v[1], r: 3, fill: "rgba(255,255,255,.16)" });
+      el("circle", { cx: v[0], cy: v[1], r: 1.2, fill: HOLE });
+    });
+    [[12, 12], [268, 100], [12, 100], [268, 12]].forEach(function (h) {
+      el("circle", { cx: h[0], cy: h[1], r: 6, fill: GOLD });
+      el("circle", { cx: h[0], cy: h[1], r: 3.6, fill: HOLE });
+    });
+    txt(140, 106, "ALTIUM IMPORTER  REV A", 7, "middle");
+    return o.join("");
+  }
+  document.getElementById("board").innerHTML = svgBoard();
+
   var sv = document.getElementById("sv"), ring = document.getElementById("ring");
   var hue = document.getElementById("hue"), knob = document.getElementById("knob");
   var board = document.getElementById("board"), row = document.getElementById("swatches");
@@ -117,9 +168,11 @@
     ring.style.left = (hsv[1] * 100) + "%";
     ring.style.top = ((1 - hsv[2]) * 100) + "%";
     knob.style.left = (hsv[0] / 360 * 100) + "%";
-    board.style.background = col.mask;
-    Array.prototype.forEach.call(board.querySelectorAll(".t"), function (e) { e.style.color = col.silk; });
-    Array.prototype.forEach.call(board.querySelectorAll(".box"), function (e) { e.style.borderColor = col.silk; });
+    function each(sel, fn) { Array.prototype.forEach.call(board.querySelectorAll(sel), fn); }
+    each(".m", function (e) { e.setAttribute("fill", col.mask); });
+    each(".tm", function (e) { e.setAttribute("stroke", col.mask); });
+    each(".ss", function (e) { e.setAttribute("stroke", col.silk); });
+    each(".sf", function (e) { e.setAttribute("fill", col.silk); });
     Array.prototype.forEach.call(row.querySelectorAll(".sw"), function (e, i) {
       e.style.background = SWATCH[cur][i];
       e.title = SWATCH[cur][i];
@@ -160,7 +213,7 @@
       var idx = Array.prototype.indexOf.call(row.querySelectorAll(".sw"), e.currentTarget);
       col[cur] = SWATCH[cur][idx]; load(cur); send();
     });
-    row.insertBefore(d, board);
+    row.appendChild(d);
   }
   ["mask", "silk"].forEach(function (k) {
     document.getElementById("t-" + k).addEventListener("click", function () { load(k); });

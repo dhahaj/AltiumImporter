@@ -228,7 +228,7 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
                     # Fusion prefixes "file:///" itself and URL-encodes backslashes
                     # (ERR_INVALID_URL), so hand it a forward-slash path.
                     bi = inputs.addBrowserCommandInput("color_picker", "",
-                                                       PICKER_HTML.replace("\\", "/"), 200, 200)
+                                                       PICKER_HTML.replace("\\", "/"), 300, 300)
                     bi.tooltip = "Pick the mask or silkscreen color"
                 except Exception:
                     pass   # older Fusion without browser inputs: hex boxes still work
