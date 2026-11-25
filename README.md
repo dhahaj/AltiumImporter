@@ -13,8 +13,8 @@ A Fusion 360 add-in that opens an Altium Designer **binary `.PcbDoc`** directly 
 | Components with **embedded STEP models** | STEP imported once per model, then placed as linked occurrences |
 | Components with Altium **extruded 3D bodies** | Extruded with the body's stand-off and overall height and its 3D color |
 | Components with no 3D body | Placeholder box from the pad extents, using the component's Height (or a default) |
-| Top and bottom copper (pads, tracks, arcs, fills, polygon pours, solid regions) | Gold copper bodies, drilled through |
-| Top and bottom solder mask | Green mask body with openings from the pad and via mask expansion (rules, manual values and tenting are honoured) |
+| Top and bottom copper (pads, including custom pad shapes, tracks, arcs, fills, polygon pours, solid regions) | Gold copper bodies, drilled through |
+| Top and bottom solder mask | Green mask body with openings from the pad and via mask expansion (custom pad shapes are grown by it too) (rules, manual values and tenting are honoured) |
 | Top and bottom overlay (silkscreen lines, arcs, fills, regions such as logos, and text) | White silkscreen body, clipped off the pads like a fab would |
 
 Everything goes under one top-level component named after the file:
@@ -80,6 +80,7 @@ You can cancel from the progress dialog at any time, and the geometry built so f
 - Silkscreen text uses Arial for Altium's stroke font and the named font for TrueType text, so letter shapes differ slightly from Altium's stroke font. TrueType text is fitted to the glyph box Altium saves with each text and anchored at its lower-left corner like in Altium (older files without that box fall back to the font's own metrics), and text frames (text boxes) honour their justification and margin. Comments show the component's own comment string. Special strings that can't be resolved (such as `.Layer_Name`) are skipped, and inverted or barcode text is drawn as plain text.
 - Solder mask is shown slightly transparent so you can see the copper underneath, like a real mask (darker and lighter presets are more opaque, as on real boards). To keep imports fast, the mask body overlaps the copper instead of being cut around it, and large polygon pours are kept as separate "copper pour" bodies. That looks the same but matters if you measure volumes or run interference checks; hide the mask and copper bodies for those.
 - Rectangular (square) holes are drilled as round holes.
+- Custom pad shapes get their mask opening by growing the shape with round corners, which can differ slightly from Altium at sharp outside corners.
 - Silkscreen fonts that aren't installed in Windows (for example a font installed only for Altium) get a stand-in that keeps roughly the same width: condensed fonts use a narrowed Arial, monospaced fonts Consolas, black weights Arial Black, anything else Arial. The summary names each one. Installing the original font in Windows (for all users) makes Fusion use it.
 - Self-intersecting extruded body outlines fall back to their bounding box.
 - Regions whose outline touches or runs back along itself (logos traced from a bitmap, where letters meet) are split into simple pieces before modelling, because Fusion can't build a face from an outline that touches itself. The filled area is the same as in Altium.

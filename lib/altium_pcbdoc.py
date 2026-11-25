@@ -209,7 +209,9 @@ class Pad:
                  "hole_shape", "slot_len", "slot_rotation", "plated", "layer",
                  "top_size", "bot_size", "top_shape", "bot_shape",
                  "top_alt", "bot_alt", "top_corner", "bot_corner",
-                 "mask_mode", "mask_manual", "tent_top", "tent_bottom")
+                 "mask_mode", "mask_manual", "tent_top", "tent_bottom",
+                 # custom pad shape (Altium 19+): copper layer -> [(outline, holes)]
+                 "custom")
 
 
 class Via:
@@ -410,6 +412,7 @@ class PcbDocReader:
                 "Not an Altium binary PcbDoc (OLE) file: %s. ASCII PcbDoc files are "
                 "not supported; re-save as binary in Altium." % e)
         self.doc = PcbDoc()
+        self._custom_pads = None
 
     def _stream(self, name):
         path = name + "/Data"
@@ -545,6 +548,7 @@ class PcbDocReader:
         p.hole_shape, p.slot_len, p.slot_rotation = 0, 0.0, 0.0
         p.top_alt = p.bot_alt = 0
         p.top_corner = p.bot_corner = 0
+        p.custom = {}
         n6 = r.subrecord()
         if n6 >= 596:
             r.skip(29 * 4 * 2 + 29 + 1)
@@ -666,7 +670,48 @@ class PcbDocReader:
                 if len(segs) < 2:
                     continue
                 holes = [_vertices_to_segments(h) for h in g["holes"] if len(h) > 2]
+                if "PADINDEX" in pr and self._attach_custom_pad(pr, g["layer"], segs, holes):
+                    continue
                 self.doc.add_shape(g["layer"], ("poly", segs, holes))
+
+    def _custom_pad_indices(self):
+        """0-based Pads6 indices that Altium lists as having a custom shape."""
+        out = set()
+        r = Reader(self._stream("CustomShapes"))
+        while r.remaining() >= 4:
+            try:
+                i = int(fnum(r.props().get("PRIMITIVEINDEX"), -1))
+            except (struct.error, IndexError, ValueError):
+                break
+            if i >= 0:
+                out.add(i)
+        return out
+
+    def _attach_custom_pad(self, props, layer, segs, holes):
+        """A pad with a custom shape (Altium 19+) is stored as a tiny pad plus
+        a region whose PADINDEX names it (1-based Pads6 index). The region is
+        the pad's real copper, and its mask opening is that outline grown by
+        the pad's expansion. Returns True if the region was given to a pad."""
+        try:
+            n = int(fnum(props.get("PADINDEX"), 0))
+        except ValueError:
+            return False
+        pads = self.doc.pads
+        if self._custom_pads is None:
+            self._custom_pads = self._custom_pad_indices()
+        xs = [pt[0] for sg in segs for pt in (sg.start, sg.end)]
+        ys = [pt[1] for sg in segs for pt in (sg.start, sg.end)]
+        tol = 0.05
+        x0, x1, y0, y1 = min(xs) - tol, max(xs) + tol, min(ys) - tol, max(ys) + tol
+        # PADINDEX is 1-based; the CustomShapes stream lists the same pads
+        # 0-based. Accept the index only if that pad sits on the shape.
+        for i in sorted((n - 1, n), key=lambda k: k not in self._custom_pads):
+            if 0 <= i < len(pads):
+                p = pads[i]
+                if x0 <= p.x <= x1 and y0 <= p.y <= y1:
+                    p.custom.setdefault(layer, []).append((segs, holes))
+                    return True
+        return False
 
     # -- Tracks6 / Arcs6 / Fills6 -------------------------------------------
     def _prim_header(self, r):
