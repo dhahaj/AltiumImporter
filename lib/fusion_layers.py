@@ -217,14 +217,34 @@ class LayerBuilder:
         return curves
 
     def poly_solid(self, outer, holes, z0, z1):
-        tb = self.tb
-        wires = []
         outer = lg.clean_loop(outer) if outer else None
         if not outer:
             return None
-        for loop in [outer] + [lg.clean_loop(h) for h in (holes or []) if h]:
-            if not loop:
-                continue
+        holes = [h for h in (lg.clean_loop(h) for h in (holes or []) if h) if h]
+        try:
+            solid = self._loops_solid(outer, holes, z0, z1)
+        except Exception:
+            if not holes:
+                raise
+            solid = None
+        if solid is None and holes:
+            # a hole that touches the outline (pixel-art logos, QR codes)
+            # makes the face fail: extrude the outline and cut the holes out
+            solid = self._loops_solid(outer, [], z0, z1)
+            if solid is not None:
+                for h in holes:
+                    try:
+                        cut = self._loops_solid(h, [], z0 - 0.01, z1 + 0.01)
+                        if cut is not None:
+                            self.tb.booleanOperation(solid, cut, DIFF)
+                    except Exception as e:
+                        self._fail("hole", str(e)[:120])
+        return solid
+
+    def _loops_solid(self, outer, holes, z0, z1):
+        tb = self.tb
+        wires = []
+        for loop in [outer] + holes:
             wire_body, _ = tb.createWireFromCurves(self._curves(loop), True)
             if wire_body is None or wire_body.wires.count == 0:
                 if loop is outer:

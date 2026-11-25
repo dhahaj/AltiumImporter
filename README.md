@@ -15,7 +15,7 @@ A Fusion 360 add-in that opens an Altium Designer **binary `.PcbDoc`** directly 
 | Components with no 3D body | Placeholder box from the pad extents, using the component's Height (or a default) |
 | Top and bottom copper (pads, tracks, arcs, fills, polygon pours, solid regions) | Gold copper bodies, drilled through |
 | Top and bottom solder mask | Green mask body with openings from the pad and via mask expansion (rules, manual values and tenting are honoured) |
-| Top and bottom overlay (silkscreen lines, arcs, fills and text) | White silkscreen body, clipped off the pads like a fab would |
+| Top and bottom overlay (silkscreen lines, arcs, fills, regions such as logos, and text) | White silkscreen body, clipped off the pads like a fab would |
 
 Everything goes under one top-level component named after the file:
 
@@ -82,6 +82,7 @@ You can cancel from the progress dialog at any time, and the geometry built so f
 - Rectangular (square) holes are drilled as round holes.
 - Silkscreen fonts that aren't installed in Windows (for example a font installed only for Altium) get a stand-in that keeps roughly the same width: condensed fonts use a narrowed Arial, monospaced fonts Consolas, black weights Arial Black, anything else Arial. The summary names each one. Installing the original font in Windows (for all users) makes Fusion use it.
 - Self-intersecting extruded body outlines fall back to their bounding box.
+- Regions whose outline touches or runs back along itself (logos traced from a bitmap, where letters meet) are split into simple pieces before modelling, because Fusion can't build a face from an outline that touches itself. The filled area is the same as in Altium.
 
 ## Project layout
 
