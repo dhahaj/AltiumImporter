@@ -335,12 +335,29 @@ class LayerBuilder:
                 sub = "Arial"
             self.fallback_fonts[t.font_name] = sub + (" (narrowed)" if sx < 1 else "")
 
+    @staticmethod
+    def _ink_box(t):
+        """Altium's own ink rectangle (w, h) in mm for a TrueType text that is
+        not a text frame, or None. Altium stores the glyphs' bounding box with
+        the text and anchors the text at its lower-left corner, so fitting
+        Fusion's ink to it gives Altium's size and position whatever the font
+        metrics or stand-in font."""
+        if t.font_type != 1 or getattr(t, "frame", False):
+            return None
+        w, h = getattr(t, "box_w", 0.0), getattr(t, "box_h", 0.0)
+        if w <= 1e-3 or h <= 1e-3:
+            return None
+        return w, h
+
     def text_solid(self, t, z0, z1):
         """Extruded text at its Altium position. Returns a temporary solid."""
         font, sx = self._font_for(t)
         cap, base_off = self._text_metrics(t)
+        box = self._ink_box(t)
+        if box:
+            base_off = 0.0           # the ink's bottom edge sits on the position
         key = (t.text, round(cap, 4), font, sx, t.bold, t.italic, t.mirrored,
-               round(z1 - z0, 5))
+               round(z1 - z0, 5), box and (round(box[0], 4), round(box[1], 4)))
         hit = self._text_cache.get(key)
         if hit is None:
             comp = self.scratch()
@@ -393,18 +410,33 @@ class LayerBuilder:
             sk.deleteMe()
             if base is None:
                 return None
-            if abs(sx - 1.0) > 1e-6:
-                # narrowed stand-in for a condensed font (scale about x=0)
+            fx, fy = sx, 1.0
+            if box:
+                # fit the ink to Altium's rectangle: height always, width
+                # too when a stand-in font replaces the one Altium used
+                bb = base.boundingBox
+                iw = (bb.maxPoint.x - bb.minPoint.x) / CM
+                ih = (bb.maxPoint.y - bb.minPoint.y) / CM
+                if iw > 1e-6 and ih > 1e-6 and 0.5 < box[1] / ih < 2:
+                    fy = box[1] / ih
+                    fx = fy
+                    if font != t.font_name and 0.5 < box[0] / iw < 2:
+                        fx = box[0] / iw
+            if abs(fx - 1.0) > 1e-6 or abs(fy - 1.0) > 1e-6:
+                # narrowed stand-in for a condensed font, or the ink fitted
+                # to Altium's box (scale about the origin)
                 m = adsk.core.Matrix3D.create()
-                m.setWithArray([sx, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+                m.setWithArray([fx, 0, 0, 0, 0, fy, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
                 self.tb.transform(base, m)
-            # normalise: left ink edge at x=0 (right edge when mirrored),
-            # last line's baseline stays at y=0 (Fusion's bottom alignment)
+            # normalise: left ink edge at x=0 (right edge when mirrored);
+            # y=0 is the last line's baseline (Fusion's bottom alignment), or
+            # the ink's bottom edge when fitting Altium's box
             bb = base.boundingBox
             ink_w = (bb.maxPoint.x - bb.minPoint.x) / CM
             dx = -bb.maxPoint.x if t.mirrored else -bb.minPoint.x
+            dy = -bb.minPoint.y if box else 0.0
             m = adsk.core.Matrix3D.create()
-            m.translation = V3(dx, 0, 0)
+            m.translation = V3(dx, dy, 0)
             self.tb.transform(base, m)
             hit = (base, ink_w)
             self._text_cache[key] = hit
