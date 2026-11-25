@@ -192,6 +192,38 @@ def shape_prims(shape):
     return []
 
 
+def _seg_angle(c, p):
+    return math.degrees(math.atan2(p[1] - c[1], p[0] - c[0]))
+
+
+def edge_sweep(s, w):
+    """Primitive covering every point within w/2 of outline segment s."""
+    if s.center is None:
+        return ("stadium", s.start[0], s.start[1], s.end[0], s.end[1], w)
+    c = s.center
+    r = math.dist(s.start, c)
+    if math.dist(s.start, s.end) < EPS:
+        sa, ea = 0.0, 360.0
+    else:
+        a, b = _seg_angle(c, s.start), _seg_angle(c, s.end)
+        sa, ea = (a, b) if s.ccw else (b, a)
+    outer, holes = arc_track(c[0], c[1], r, sa, ea, w)
+    return ("poly", outer, holes)
+
+
+def grown_prims(outer, holes, grow):
+    """A region grown outward by `grow` mm with round corners (its Minkowski
+    sum with a disc): the region itself plus a sweep along every edge. Used
+    for the solder mask opening of a custom-shaped pad."""
+    out = shape_prims(("poly", outer, holes))
+    if grow <= GEOM_TOL:
+        return out
+    for loop in [outer] + list(holes):
+        for s in loop:
+            out.append(edge_sweep(s, 2.0 * grow))
+    return out
+
+
 def _pad_on_side(pad, side):
     layer = LAYER_TOP if side == "top" else LAYER_BOTTOM
     return pad.layer == layer or pad.layer == MULTI
@@ -204,6 +236,10 @@ def copper_prims(doc, side):
         out.extend(shape_prims(s))
     for p in doc.pads:
         if _pad_on_side(p, side):
+            if layer in p.custom:
+                for outer, holes in p.custom[layer]:
+                    out.extend(shape_prims(("poly", outer, holes)))
+                continue
             q = pad_prim(p, side)
             if q:
                 out.append(q)
@@ -232,6 +268,15 @@ def mask_opening_prims(doc, side):
         if (side == "top" and p.tent_top) or (side == "bottom" and p.tent_bottom):
             continue
         grow = p.mask_manual if p.mask_mode == 2 else doc.mask_expansion
+        if layer in p.custom:             # custom shape drawn on the mask layer
+            for outer, holes in p.custom[layer]:
+                out.extend(shape_prims(("poly", outer, holes)))
+            continue
+        cu = LAYER_TOP if side == "top" else LAYER_BOTTOM
+        if cu in p.custom:
+            for outer, holes in p.custom[cu]:
+                out.extend(grown_prims(outer, holes, grow))
+            continue
         q = pad_prim(p, side, grow)
         if q:
             out.append(q)
