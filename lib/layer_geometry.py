@@ -188,7 +188,7 @@ def shape_prims(shape):
             return [("circle", o.center[0], o.center[1], math.dist(o.start, o.center))]
         return [("poly", outer, holes)]
     if kind == "poly":
-        return [("poly", shape[1], shape[2])]
+        return [("poly", o, h) for o, h in split_self_touching(shape[1], shape[2])]
     return []
 
 
@@ -402,3 +402,306 @@ def _drop_collinear(segs, tol):
         pts = [p for p, k in zip(pts, keep) if k]
     n = len(pts)
     return [Segment(pts[i], pts[(i + 1) % n]) for i in range(n)]
+
+
+# ----------------------------------------------------------------------------
+# Self-touching outlines
+# ----------------------------------------------------------------------------
+# Logos traced from bitmaps (and some imported DXF artwork) are stored by
+# Altium as ONE region whose outline runs along itself where letters meet:
+# a zero-width slit, or a corner of one letter resting on the edge of the
+# next. Altium fills that fine, but Fusion's createFaceFromPlanarWires
+# rejects a wire that touches itself, so the whole region silently vanished.
+# split_self_touching cuts such an outline into simple loops: it inserts a
+# vertex wherever the outline meets itself, cancels the edge pairs that run
+# back over each other (the slits), and walks what is left into loops,
+# turning towards the filled side at every junction so touching lobes come
+# apart instead of forming a figure eight.
+
+TOUCH_TOL = 2.5e-4   # mm; half of clean_loop's tolerance
+
+
+def _area2(pts):
+    n = len(pts)
+    return sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+               for i in range(n))
+
+
+def _point_in(pt, pts):
+    x, y = pt
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            if x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                inside = not inside
+    return inside
+
+
+def _on_segment(p, a, b, tol):
+    """Parameter t of p's projection on a-b if p lies within tol of the
+    segment's interior, else None."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L2 = dx * dx + dy * dy
+    if L2 < tol * tol:
+        return None
+    t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2
+    L = math.sqrt(L2)
+    if t * L <= tol or (1 - t) * L <= tol:
+        return None                      # at an endpoint: already a vertex
+    if abs((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / L > tol:
+        return None
+    return t
+
+
+def _crossing(a, b, c, d, tol):
+    """Proper crossing point of a-b and c-d (interiors), or None."""
+    r = (b[0] - a[0], b[1] - a[1])
+    s = (d[0] - c[0], d[1] - c[1])
+    den = r[0] * s[1] - r[1] * s[0]
+    if abs(den) < 1e-15:
+        return None
+    qp = (c[0] - a[0], c[1] - a[1])
+    t = (qp[0] * s[1] - qp[1] * s[0]) / den
+    u = (qp[0] * r[1] - qp[1] * r[0]) / den
+    lr, ls = math.hypot(*r), math.hypot(*s)
+    if t * lr <= tol or (1 - t) * lr <= tol or u * ls <= tol or (1 - u) * ls <= tol:
+        return None
+    return t, u, (a[0] + t * r[0], a[1] + t * r[1])
+
+
+def _split_points(pts, tol):
+    """For a closed polyline, the extra vertices (edge index -> [(t, point)])
+    where the outline touches or crosses itself. Empty when it is simple."""
+    n = len(pts)
+    edges = [(pts[i], pts[(i + 1) % n]) for i in range(n)]
+    lens = [math.dist(a, b) for a, b in edges]
+    cell = max(sum(lens) / max(n, 1) * 2, tol * 10)
+    grid = {}
+    for i, (a, b) in enumerate(edges):
+        x0, x1 = sorted((a[0], b[0]))
+        y0, y1 = sorted((a[1], b[1]))
+        for gx in range(int(math.floor((x0 - tol) / cell)), int(math.floor((x1 + tol) / cell)) + 1):
+            for gy in range(int(math.floor((y0 - tol) / cell)), int(math.floor((y1 + tol) / cell)) + 1):
+                grid.setdefault((gx, gy), []).append(i)
+    splits = {}
+    seen = set()
+    for bucket in grid.values():
+        m = len(bucket)
+        for ii in range(m):
+            i = bucket[ii]
+            a, b = edges[i]
+            for jj in range(ii + 1, m):
+                j = bucket[jj]
+                if (i, j) in seen:
+                    continue
+                seen.add((i, j))
+                c, d = edges[j]
+                adjacent = (j - i) % n in (1, n - 1)
+                # an endpoint of one edge lying on the other one's interior
+                for p, (e0, e1), k in ((c, (a, b), i), (d, (a, b), i),
+                                       (a, (c, d), j), (b, (c, d), j)):
+                    t = _on_segment(p, e0, e1, tol)
+                    if t is not None:
+                        splits.setdefault(k, []).append((t, p))
+                if not adjacent:
+                    x = _crossing(a, b, c, d, tol)
+                    if x is not None:
+                        t, u, p = x
+                        splits.setdefault(i, []).append((t, p))
+                        splits.setdefault(j, []).append((u, p))
+    # a vertex resting on another vertex (two corners touching) needs no
+    # split point but still makes the loop non-simple
+    keys = {}
+    for i, p in enumerate(pts):
+        k = (round(p[0] / tol), round(p[1] / tol))
+        if k in keys:
+            splits.setdefault(i, [])
+        keys[k] = i
+    return splits
+
+
+class _Snap:
+    """Merges points closer than tol into one representative."""
+
+    def __init__(self, tol):
+        self.tol = tol
+        self.cells = {}
+
+    def __call__(self, p):
+        cx, cy = int(math.floor(p[0] / self.tol)), int(math.floor(p[1] / self.tol))
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for q in self.cells.get((gx, gy), ()):
+                    if math.dist(p, q) <= self.tol:
+                        return q
+        self.cells.setdefault((cx, cy), []).append(p)
+        return p
+
+
+def _simple_loops(pts, tol):
+    """Split one closed polyline into simple closed polylines. Returns None
+    when the input is already simple."""
+    splits = _split_points(pts, tol)
+    if not splits:
+        return None
+    snap = _Snap(tol)
+    chain = []
+    n = len(pts)
+    for i in range(n):
+        chain.append(snap(pts[i]))
+        for _, p in sorted(splits.get(i, [])):
+            chain.append(snap(p))
+    edges = {}
+    m = len(chain)
+    for i in range(m):
+        u, v = chain[i], chain[(i + 1) % m]
+        if u != v:
+            edges[(u, v)] = edges.get((u, v), 0) + 1
+    # a slit is the outline running out and straight back: cancel the pairs
+    for (u, v) in list(edges):
+        k = min(edges.get((u, v), 0), edges.get((v, u), 0))
+        if k:
+            edges[(u, v)] -= k
+            edges[(v, u)] -= k
+    out = {}
+    for (u, v), k in edges.items():
+        for _ in range(k):
+            out.setdefault(u, []).append(v)
+    cw = _area2(pts) < 0
+    loops = []
+    while out:
+        start = next(iter(out))
+        loop = [start]
+        prev, cur = None, start
+        while True:
+            nxt = out.get(cur)
+            if not nxt:
+                break
+            if len(nxt) == 1 or prev is None:
+                v = nxt[0]
+            else:
+                # turn as far as possible towards the filled side (right for
+                # a clockwise outline) so touching lobes separate
+                hx, hy = cur[0] - prev[0], cur[1] - prev[1]
+                h = math.atan2(hy, hx)
+
+                def turn(q):
+                    a = math.atan2(q[1] - cur[1], q[0] - cur[0]) - h
+                    a = (a + math.pi) % (2 * math.pi) - math.pi   # -pi..pi, left positive
+                    return a if cw else -a
+                v = min(nxt, key=turn)
+            nxt.remove(v)
+            if not nxt:
+                del out[cur]
+            prev, cur = cur, v
+            if cur == start:
+                break
+            loop.append(cur)
+        loops.extend(_split_at_repeats(loop))
+    return loops
+
+
+def _split_at_repeats(loop):
+    """Cut a closed walk that passes through a vertex twice (a void pinched
+    onto the outline at one corner) into loops that visit each vertex once."""
+    out, stack, where = [], [], {}
+    for p in loop:
+        if p in where:
+            k = where[p]
+            sub = stack[k:]
+            for q in sub[1:]:
+                del where[q]
+            del stack[k + 1:]
+            if len(sub) >= 3:
+                out.append(sub)
+        else:
+            where[p] = len(stack)
+            stack.append(p)
+    if len(stack) >= 3:
+        out.append(stack)
+    return out
+
+
+def _segments(pts):
+    n = len(pts)
+    return [Segment(pts[i], pts[(i + 1) % n]) for i in range(n)]
+
+
+MIN_AREA2 = 1e-6    # twice the area (mm^2) below which a split-off loop is a sliver
+
+
+def _split_hole(hole, tol):
+    """A self-touching hole becomes several simple holes."""
+    if len(hole) < 4 or any(s.center is not None for s in hole):
+        return [hole]
+    pts = [s.start for s in hole]
+    loops = _simple_loops(pts, tol)
+    if loops is None:
+        return [hole]
+    sign = _area2(pts)
+    return [_segments(lp) for lp in loops
+            if _area2(lp) * sign > 0 and abs(_area2(lp)) >= MIN_AREA2]
+
+
+def split_self_touching(outer, holes, tol=TOUCH_TOL):
+    """[(outer, holes)] for a region, with a self-touching or self-crossing
+    straight-edged outer loop cut into simple loops. Returns the region as it
+    is when it is already simple (the usual case) or has arcs."""
+    holes = [h2 for h in (holes or []) for h2 in _split_hole(h, tol)]
+    if len(outer) < 4 or any(s.center is not None for s in outer):
+        return [(outer, holes)]
+    pts = [s.start for s in outer]
+    loops = _simple_loops(pts, tol)
+    if loops is None:
+        return [(outer, holes)]
+    sign = 1 if _area2(pts) > 0 else -1
+    min_area2 = MIN_AREA2
+    solids, voids = [], []
+    for lp in loops:
+        a = _area2(lp)
+        if abs(a) < min_area2:
+            continue                     # leftover sliver of a slit
+        (solids if a * sign > 0 else voids).append(lp)
+
+    def probe(lp):
+        # a point just inside the loop, away from shared vertices
+        for i in range(len(lp)):
+            a, b = lp[i], lp[(i + 1) % len(lp)]
+            L = math.dist(a, b)
+            if L > 4 * tol:
+                mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+                nx, ny = -(b[1] - a[1]) / L, (b[0] - a[0]) / L    # left normal
+                off = 2 * tol if _area2(lp) > 0 else -2 * tol
+                return (mx + nx * off, my + ny * off)
+        return lp[0]
+
+    regions = [[lp, []] for lp in solids]
+
+    def owner(pt):
+        best, best_a = None, None
+        for r in regions:
+            if _point_in(pt, r[0]):
+                a = abs(_area2(r[0]))
+                if best is None or a < best_a:
+                    best, best_a = r, a
+        return best
+
+    for lp in voids:
+        # the probe sits inside the void loop; it is a hole only if a solid
+        # loop surrounds it, else it is a lobe wound the other way (a bowtie)
+        r = owner(probe(lp))
+        if r is not None:
+            r[1].append(_segments(lp))
+        else:
+            regions.append([lp[::-1], []])
+    if not regions:
+        return [(outer, holes)]
+    for h in holes:
+        if not h:
+            continue
+        r = owner(probe([g.start for g in h])) or regions[0]
+        r[1].append(h)
+    return [(_segments(o), hs) for o, hs in regions]
