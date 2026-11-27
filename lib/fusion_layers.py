@@ -16,6 +16,7 @@ import adsk.fusion
 
 import layer_geometry as lg
 import font_metrics
+import font_outline
 
 CM = 0.1
 P3 = adsk.core.Point3D.create
@@ -23,6 +24,14 @@ V3 = adsk.core.Vector3D.create
 UNION = adsk.fusion.BooleanTypes.UnionBooleanType
 DIFF = adsk.fusion.BooleanTypes.DifferenceBooleanType
 INTERSECT = adsk.fusion.BooleanTypes.IntersectionBooleanType
+
+
+_RETRY = object()      # text_solid: font choice changed, build again
+
+
+def _msg(e):
+    """First line of an exception message, short."""
+    return str(e).splitlines()[0][:120] if str(e) else type(e).__name__
 
 
 def _degenerate(q):
@@ -58,6 +67,9 @@ class LayerBuilder:
         self._text_cache = {}
         self._bad_fonts = set()
         self.fallback_fonts = {}        # font Fusion could not use -> substitute used
+        self.outline_fonts = set()      # fonts Fusion types but can't extrude: drawn
+                                        # from the font file's own glyph outlines
+        self.outline_errors = {}        # font -> why its outlines couldn't be read
         self.failed = 0
         self.fail_info = {}     # kind -> [count, first error]
 
@@ -251,6 +263,12 @@ class LayerBuilder:
                     return None
                 continue
             wires.append(wire_body)
+        return self._wires_solid(wires, z0, z1)
+
+    def _wires_solid(self, wires, z0, z1):
+        """Extrude the planar face bounded by wires (first = outer) to a
+        temporary solid between z0 and z1 (mm)."""
+        tb = self.tb
         face_body = tb.createFaceFromPlanarWires(wires)
         if face_body is None or face_body.faces.count == 0:
             return None
@@ -352,62 +370,28 @@ class LayerBuilder:
     def text_solid(self, t, z0, z1):
         """Extruded text at its Altium position. Returns a temporary solid."""
         font, sx = self._font_for(t)
+        outline = font == t.font_name and font in self.outline_fonts
         cap, base_off = self._text_metrics(t)
         box = self._ink_box(t)
         if box:
             base_off = 0.0           # the ink's bottom edge sits on the position
-        key = (t.text, round(cap, 4), font, sx, t.bold, t.italic, t.mirrored,
+        key = (t.text, round(cap, 4), font, outline, sx, t.bold, t.italic, t.mirrored,
                round(z1 - z0, 5), box and (round(box[0], 4), round(box[1], 4)))
         hit = self._text_cache.get(key)
         if hit is None:
-            comp = self.scratch()
-            sk = comp.sketches.add(comp.xYConstructionPlane)
-            hc = cap * CM
-            lines = t.text.split("\n")
-            width = max(len(s) for s in lines) * hc * 2.0 + hc
-            ti = sk.sketchTexts.createInput2(t.text, hc)
-            ti.setAsMultiLine(P3(0, 0, 0), P3(width, hc * 2.4 * len(lines), 0),
-                              adsk.core.HorizontalAlignments.LeftHorizontalAlignment,
-                              adsk.core.VerticalAlignments.BottomVerticalAlignment, 0)
-            try:
-                ti.fontName = font
-            except Exception:
-                if font == "Arial":
-                    raise
-                sk.deleteMe()
-                self._mark_bad(t, font)
-                return self.text_solid(t, z0, z1)
-            style = 0
-            if t.bold:
-                style |= adsk.fusion.TextStyles.TextStyleBold
-            if t.italic:
-                style |= adsk.fusion.TextStyles.TextStyleItalic
-            if style:
-                ti.textStyle = style
-            if t.mirrored:
-                ti.isHorizontalFlip = True
-            try:
-                st = sk.sketchTexts.add(ti)
-            except Exception:
-                if font == "Arial":
-                    raise
-                # font not installed for Fusion: use a stand-in
-                sk.deleteMe()
-                self._mark_bad(t, font)
-                return self.text_solid(t, z0, z1)
-            ext = comp.features.extrudeFeatures.addSimple(
-                st, adsk.core.ValueInput.createByReal((z1 - z0) * CM),
-                adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
-            base = None
-            for i in range(ext.bodies.count):
-                c = self.tb.copy(ext.bodies.item(i))
-                if base is None:
-                    base = c
-                else:
-                    self.tb.booleanOperation(base, c, UNION)
-            for i in range(ext.bodies.count - 1, -1, -1):
-                ext.bodies.item(i).deleteMe()
-            sk.deleteMe()
+            if outline:
+                try:
+                    base = self._outline_base(t, z1 - z0)
+                except Exception as e:
+                    # the font file can't be read either: use a stand-in font
+                    self.outline_fonts.discard(font)
+                    self.outline_errors[font] = _msg(e)
+                    self._mark_bad(t, font)
+                    return self.text_solid(t, z0, z1)
+            else:
+                base = self._sketch_base(t, font, cap, z1 - z0)
+                if base is _RETRY:
+                    return self.text_solid(t, z0, z1)
             if base is None:
                 return None
             fx, fy = sx, 1.0
@@ -458,6 +442,127 @@ class LayerBuilder:
         if not self.tb.transform(body, m):
             return None
         return body
+
+    def _sketch_base(self, t, font, cap, depth):
+        """Text typed in a Fusion sketch with font and extruded by depth (mm).
+        Returns the temporary solid, None, or _RETRY after switching t's font
+        to the glyph-outline path or a stand-in."""
+        comp = self.scratch()
+        sk = comp.sketches.add(comp.xYConstructionPlane)
+        hc = cap * CM
+        lines = t.text.split("\n")
+        width = max(len(s) for s in lines) * hc * 2.0 + hc
+        ti = sk.sketchTexts.createInput2(t.text, hc)
+        ti.setAsMultiLine(P3(0, 0, 0), P3(width, hc * 2.4 * len(lines), 0),
+                          adsk.core.HorizontalAlignments.LeftHorizontalAlignment,
+                          adsk.core.VerticalAlignments.BottomVerticalAlignment, 0)
+        try:
+            ti.fontName = font
+        except Exception:
+            if font == "Arial":
+                raise
+            sk.deleteMe()
+            self._mark_bad(t, font)
+            return _RETRY
+        style = 0
+        if t.bold:
+            style |= adsk.fusion.TextStyles.TextStyleBold
+        if t.italic:
+            style |= adsk.fusion.TextStyles.TextStyleItalic
+        if style:
+            ti.textStyle = style
+        if t.mirrored:
+            ti.isHorizontalFlip = True
+        try:
+            st = sk.sketchTexts.add(ti)
+        except Exception:
+            if font == "Arial":
+                raise
+            # font not installed for Fusion: use a stand-in
+            sk.deleteMe()
+            self._mark_bad(t, font)
+            return _RETRY
+        try:
+            ext = comp.features.extrudeFeatures.addSimple(
+                st, adsk.core.ValueInput.createByReal(depth * CM),
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+            n = ext.bodies.count
+        except Exception as e:
+            ext, n, err = None, 0, _msg(e)
+        else:
+            err = "no bodies"
+        if n == 0:
+            # Fusion types some fonts (PostScript-flavoured .otf such as
+            # "ROG Fonts") but can't make profiles from them: the extrude
+            # fails with "Some input argument is invalid". Read the glyphs
+            # from the font file instead.
+            sk.deleteMe()
+            if font == t.font_name and font not in self.outline_errors:
+                self.outline_fonts.add(font)
+                return _RETRY
+            if font == "Arial":
+                raise RuntimeError("text extrude failed: %s" % err)
+            self._mark_bad(t, font)
+            return _RETRY
+        base = None
+        for i in range(n):
+            c = self.tb.copy(ext.bodies.item(i))
+            if base is None:
+                base = c
+            else:
+                self.tb.booleanOperation(base, c, UNION)
+        for i in range(n - 1, -1, -1):
+            ext.bodies.item(i).deleteMe()
+        sk.deleteMe()
+        return base
+
+    def _outline_base(self, t, depth):
+        """Text built from the glyph outlines in the font file itself,
+        extruded by depth (mm): baseline at y=0, starting at x=0."""
+        path, styled = font_metrics.font_file(t.font_name, t.bold, t.italic)
+        if not path:
+            raise font_outline.FontError("font file not found")
+        font = font_outline.load(path)
+        # no italic face installed: slant the upright one, as Windows does
+        shear = math.tan(math.radians(12)) if t.italic and not styled else 0.0
+        glyphs = font_outline.text_shapes(font, t.text, t.height, t.mirrored, shear)
+        tb = self.tb
+        solids, errors = [], []
+        for shapes in glyphs:
+            for outer, holes in shapes:
+                try:
+                    s = self._pts_solid(outer, -0.0, depth)
+                    if s is None:
+                        raise RuntimeError("no face")
+                    for h in holes:
+                        cut = self._pts_solid(h, -0.01, depth + 0.01)
+                        if cut is not None:
+                            tb.booleanOperation(s, cut, DIFF)
+                    solids.append(s)
+                except Exception as e:
+                    errors.append(_msg(e))
+        if errors:
+            self._fail("glyph", "%r in %s: %s" % (t.text, t.font_name, errors[0]))
+        merged = self.merge(solids)
+        if not merged:
+            return None
+        base = merged[0]
+        for extra in merged[1:]:
+            tb.booleanOperation(base, extra, UNION)
+        return base
+
+    def _pts_solid(self, pts, z0, z1):
+        """Solid from one closed polyline given in local mm (no board offset)."""
+        curves = []
+        n = len(pts)
+        for i in range(n):
+            x0, y0 = pts[i]
+            x1, y1 = pts[(i + 1) % n]
+            curves.append(adsk.core.Line3D.create(P3(x0 * CM, y0 * CM, 0), P3(x1 * CM, y1 * CM, 0)))
+        wire_body, _ = self.tb.createWireFromCurves(curves, True)
+        if wire_body is None or wire_body.wires.count == 0:
+            return None
+        return self._wires_solid([wire_body], z0, z1)
 
     @staticmethod
     def _text_offset(t, ink_w, base_off):

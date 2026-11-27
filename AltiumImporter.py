@@ -339,9 +339,20 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             builder = fusion_builder.Builder(doc, opt, name, progress)
             log = builder.build()
             progress.hide()
-            msg = "\n".join([doc.summary(), ""] + log[:25] + doc.warnings[:10])
-            if len(log) > 25:
-                msg += "\n... %d more messages" % (len(log) - 25)
+            # problems first, so a skipped shape or text can't hide below
+            # the routine lines
+            problems = list(builder.problems) + list(doc.warnings)
+            rest = [m for m in log if m not in builder.problems]
+            parts = [doc.summary(), ""]
+            if problems:
+                parts += ["Problems:"] + problems[:15]
+                if len(problems) > 15:
+                    parts.append("... %d more problems" % (len(problems) - 15))
+                parts.append("")
+            parts += rest[:20]
+            if len(rest) > 20:
+                parts.append("... %d more messages" % (len(rest) - 20))
+            msg = "\n".join(parts)
             _ui.messageBox(msg, CMD_NAME + " - done")
         except KeyboardInterrupt:
             if progress:

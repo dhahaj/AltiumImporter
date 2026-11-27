@@ -82,6 +82,8 @@ You can cancel from the progress dialog at any time, and the geometry built so f
 - Rectangular (square) holes are drilled as round holes.
 - Custom pad shapes get their mask opening by growing the shape with round corners, which can differ slightly from Altium at sharp outside corners.
 - Silkscreen fonts that aren't installed in Windows (for example a font installed only for Altium) get a stand-in that keeps roughly the same width: condensed fonts use a narrowed Arial, monospaced fonts Consolas, black weights Arial Black, anything else Arial. The summary names each one. Installing the original font in Windows (for all users) makes Fusion use it.
+- Some installed fonts, mostly PostScript-flavoured `.otf` files such as ROG Fonts, can be typed into a Fusion sketch but not extruded ("Some input argument is invalid"). For those the importer reads the glyph outlines straight from the font file and builds the text from them, so it keeps its real shape. The summary lists the fonts it handled this way.
+- Anything that could not be built (a text, a glyph, a region) is listed under **Problems** at the top of the summary, never dropped silently.
 - Self-intersecting extruded body outlines fall back to their bounding box.
 - Regions whose outline touches or runs back along itself (logos traced from a bitmap, where letters meet) are split into simple pieces before modelling, because Fusion can't build a face from an outline that touches itself. The filled area is the same as in Altium.
 
@@ -97,6 +99,7 @@ AltiumImporter/
     ├── altium_pcbdoc.py     # pure-Python PcbDoc reader (no Fusion dependency)
     ├── layer_geometry.py    # pure-Python copper/mask/silk shapes per layer
     ├── font_metrics.py      # reads installed font metrics to size TrueType text
+    ├── font_outline.py      # reads glyph outlines (TrueType and CFF) for fonts Fusion can't extrude
     ├── fusion_builder.py    # turns the parsed board into Fusion geometry
     ├── fusion_layers.py     # fast solid modelling for the thin layers
     ├── olefile.py           # vendored OLE2 reader (BSD, © Philippe Lagadec)

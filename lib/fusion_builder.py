@@ -172,6 +172,7 @@ class Builder:
         self.progress = progress
         self.app = adsk.core.Application.get()
         self.log = []
+        self.problems = []      # things that went wrong; shown first
         self._appearances = {}
         self._model_components = {}
         self._tmpdir = None
@@ -349,6 +350,11 @@ class Builder:
         app.activeViewport.fit()
         return self.log
 
+    def warn(self, msg):
+        """Log something that went wrong, so it is listed first."""
+        self.problems.append(msg)
+        self.log.append(msg)
+
     # -- layer heights ---------------------------------------------------------
     def core_z(self):
         if self.opt.copper:
@@ -474,9 +480,15 @@ class Builder:
                     extra = []
                     for i, tx in enumerate(texts):
                         try:
-                            extra.append(lb.text_solid(tx, zs[0], zs[1]))
+                            body = lb.text_solid(tx, zs[0], zs[1])
                         except Exception as e:
+                            body = None
                             lb._fail("text", "%r: %s" % (tx.text, str(e)[:80]))
+                        else:
+                            if body is None:
+                                lb._fail("text", "%r: no geometry" % tx.text)
+                        if body is not None:
+                            extra.append(body)
                         if i % 20 == 0:
                             self.step("%s silkscreen text %d/%d" % (label, i, len(texts)), base + 8)
                     for j, part in enumerate(lb.union_all(prims, zs[0], zs[1], extra=extra)):
@@ -484,11 +496,16 @@ class Builder:
                         part = lb.subtract(part, drills)
                         self.add_temp_body(comp, part, "%s silkscreen" % label if j == 0
                                            else "%s silkscreen %d" % (label, j + 1), opt.silk_rgb)
+            if lb.outline_fonts:
+                self.log.append("Silkscreen: Fusion can't extrude text in %s; glyphs read from the font file"
+                                % ", ".join(sorted(lb.outline_fonts)))
             if lb.fallback_fonts:
-                self.log.append("Silkscreen: font(s) not installed on this PC, stand-ins used: %s"
-                                % "; ".join("%s -> %s" % kv for kv in sorted(lb.fallback_fonts.items())))
+                self.warn("Silkscreen: font(s) Fusion can't use, stand-ins used: %s"
+                          % "; ".join("%s -> %s%s" % (f, sub, " (font file: %s)" % lb.outline_errors[f]
+                                                     if f in lb.outline_errors else "")
+                                      for f, sub in sorted(lb.fallback_fonts.items())))
             if lb.failed:
-                self.log.append("Layers: %d shapes could not be built: %s" % (lb.failed, lb.fail_summary()))
+                self.warn("Layers: %d shapes could not be built: %s" % (lb.failed, lb.fail_summary()))
         finally:
             lb.close()
 
@@ -506,7 +523,7 @@ class Builder:
             try:
                 return lb.tb.copy(body), self.board_drilled
             except Exception as e:
-                self.log.append("Mask: board copy failed (%s), rebuilding outline" % str(e)[:80])
+                self.warn("Mask: board copy failed (%s), rebuilding outline" % str(e)[:80])
         doc, t = self.doc, self.t
         base = lb.poly_solid(doc.outline, [], -1.0, t + 1.0)
         if base is not None and self.opt.cutouts and doc.cutouts:
@@ -607,7 +624,7 @@ class Builder:
                 comp.features.extrudeFeatures.add(ei)
                 self.board_drilled = True
             except Exception as e:  # keep going; holes are nice-to-have
-                self.log.append("Hole cut failed: %s" % e)
+                self.warn("Hole cut failed: %s" % e)
         cut.isVisible = False
         sk.isVisible = False
         self.log.append("Board: %.3f mm thick, %d holes/cutouts" % (self.t, n))
@@ -644,7 +661,7 @@ class Builder:
                     raise
                 except Exception as e:
                     stats["failed"] += 1
-                    self.log.append("%s: body failed (%s)" % (c.designator, e))
+                    self.warn("%s: body failed (%s)" % (c.designator, e))
             if not made and self.opt.placeholders:
                 bb = c.pad_bounds()
                 if bb and bb[2] - bb[0] > 0 and bb[3] - bb[1] > 0:
@@ -656,7 +673,7 @@ class Builder:
                         made = True
                     except Exception as e:
                         stats["failed"] += 1
-                        self.log.append("%s: placeholder failed (%s)" % (c.designator, e))
+                        self.warn("%s: placeholder failed (%s)" % (c.designator, e))
             if not made:
                 c_occ.deleteMe()
 

@@ -50,18 +50,76 @@ def _font_index():
     return _index
 
 
+def _style_names(bold, italic):
+    return ("bold italic" if bold and italic else "bold" if bold
+            else "italic" if italic else "")
+
+
 def _find(family, bold, italic):
+    """(path, styled): the font file for family, and whether it is the
+    requested bold/italic face (False when only the regular face exists)."""
     idx = _font_index()
     fam = family.strip().lower()
-    style = ("bold italic" if bold and italic else "bold" if bold
-             else "italic" if italic else "")
-    for cand in ([fam + " " + style] if style else []) + [fam, fam + " regular"]:
+    style = _style_names(bold, italic)
+    if style and fam + " " + style in idx:
+        return idx[fam + " " + style], True
+    for cand in (fam, fam + " regular"):
         if cand in idx:
-            return idx[cand]
+            return idx[cand], not style
+    # The registry name is often not the family name ("ROGFonts-Regular" for
+    # family "ROG Fonts"), so ask the font files themselves.
+    faces = _scan_families().get(fam)
+    if faces:
+        want = style or "regular"
+        for sub, path in faces:
+            if sub == want:
+                return path, True
+        for sub, path in faces:
+            if sub in ("regular", "normal", "book", "roman"):
+                return path, not style
+        return faces[0][1], False
     for name, path in idx.items():
         if name.startswith(fam + " "):
-            return path
-    return None
+            return path, not style
+    return None, False
+
+
+_families = None
+
+
+def _scan_families():
+    """{lower-case family name: [(lower-case subfamily, file path)]} from the
+    fonts' own name tables, for families the registry names don't give
+    away. Reads only each file's table directory and name table."""
+    global _families
+    if _families is None:
+        _families = {}
+        try:
+            import font_outline
+        except ImportError:
+            return _families
+        for path in sorted(set(_font_index().values())):
+            try:
+                pairs = font_outline.file_families(path, with_style=True)
+            except Exception:
+                continue
+            for fam, sub in pairs:
+                faces = _families.setdefault(fam.lower(), [])
+                if (sub.lower(), path) not in faces:
+                    faces.append((sub.lower(), path))
+    return _families
+
+
+def font_file(family, bold=False, italic=False):
+    """(path or None, styled) for an installed font family; styled is False
+    when the bold/italic face asked for isn't installed."""
+    try:
+        path, styled = _find(family, bold, italic)
+    except Exception:
+        return None, False
+    if path and os.path.exists(path):
+        return path, styled
+    return None, False
 
 
 def _read_metrics(path):
@@ -96,8 +154,8 @@ def metrics(family, bold=False, italic=False):
     if key not in _cache:
         res = DEFAULT
         try:
-            path = _find(family, bold, italic)
-            if path and os.path.exists(path):
+            path, _ = font_file(family, bold, italic)
+            if path:
                 cap, desc = _read_metrics(path)
                 if 0.3 < cap < 0.9 and 0.0 <= desc < 0.5:
                     res = (cap, desc)
